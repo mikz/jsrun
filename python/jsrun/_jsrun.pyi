@@ -39,7 +39,7 @@ class V8Error(Exception):
 
 class Runtime:
     """
-    Tokio-based async JavaScript runtime.
+    Async JavaScript runtime.
 
     Each Runtime runs on a dedicated OS thread with its own V8 isolate
     and provides async-first JavaScript execution with promise support.
