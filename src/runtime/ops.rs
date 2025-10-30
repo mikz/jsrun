@@ -4,7 +4,10 @@
 //! to expose functions to JavaScript with permission checking and async support.
 
 use super::config;
+use super::op_driver::OpScheduling;
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 /// Permission types for ops.
@@ -86,6 +89,71 @@ pub enum OpMode {
 /// Handlers receive arguments as JSON and return a result as JSON.
 pub type OpHandler =
     Arc<dyn Fn(Vec<serde_json::Value>) -> Result<serde_json::Value, String> + Send + Sync>;
+
+/// Outcome of calling an operation.
+///
+/// Operations can either:
+/// - Return synchronously with an immediate result
+/// - Return asynchronously with a future to be polled by the OpDriver
+pub enum OpCallOutcome {
+    /// Synchronous result - completed immediately
+    Sync(Result<serde_json::Value, String>),
+    /// Asynchronous future - to be polled by the driver
+    Async {
+        future: Pin<Box<dyn Future<Output = Result<serde_json::Value, String>> + 'static>>,
+        scheduling: OpScheduling,
+    },
+}
+
+impl std::fmt::Debug for OpCallOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OpCallOutcome::Sync(result) => f.debug_tuple("Sync").field(result).finish(),
+            OpCallOutcome::Async { scheduling, .. } => f
+                .debug_struct("Async")
+                .field("scheduling", scheduling)
+                .field("future", &"<future>")
+                .finish(),
+        }
+    }
+}
+
+impl OpCallOutcome {
+    /// Create a sync outcome
+    pub fn sync(result: Result<serde_json::Value, String>) -> Self {
+        OpCallOutcome::Sync(result)
+    }
+
+    /// Create an async outcome with eager scheduling
+    pub fn async_eager(
+        future: impl Future<Output = Result<serde_json::Value, String>> + 'static,
+    ) -> Self {
+        OpCallOutcome::Async {
+            future: Box::pin(future),
+            scheduling: OpScheduling::Eager,
+        }
+    }
+
+    /// Create an async outcome with lazy scheduling
+    pub fn async_lazy(
+        future: impl Future<Output = Result<serde_json::Value, String>> + 'static,
+    ) -> Self {
+        OpCallOutcome::Async {
+            future: Box::pin(future),
+            scheduling: OpScheduling::Lazy,
+        }
+    }
+
+    /// Check if this is a sync outcome
+    pub fn is_sync(&self) -> bool {
+        matches!(self, OpCallOutcome::Sync(_))
+    }
+
+    /// Check if this is an async outcome
+    pub fn is_async(&self) -> bool {
+        matches!(self, OpCallOutcome::Async { .. })
+    }
+}
 
 /// Metadata for a registered op.
 #[derive(Clone)]
@@ -203,6 +271,36 @@ impl OpRegistry {
 
         // Call the handler
         (metadata.handler)(args)
+    }
+
+    /// Check permissions and call an op, returning an OpCallOutcome.
+    ///
+    /// This method supports both sync and async operations. For now, all handlers
+    /// are wrapped as sync outcomes for backward compatibility. Future enhancements
+    /// will support true async handlers (e.g., Python coroutines).
+    pub fn call_op_outcome(
+        &self,
+        op_id: u32,
+        args: Vec<serde_json::Value>,
+    ) -> Result<OpCallOutcome, String> {
+        let metadata = self
+            .get_by_id(op_id)
+            .ok_or_else(|| format!("Op {} not found", op_id))?;
+
+        // Check permissions
+        for required_perm in &metadata.permissions {
+            if !self.has_permission(required_perm) {
+                return Err(format!(
+                    "Permission denied: op '{}' requires {:?}",
+                    metadata.name, required_perm
+                ));
+            }
+        }
+
+        // For now, all existing handlers are synchronous
+        // In the future, we can detect Python coroutines here and return Async outcome
+        let result = (metadata.handler)(args);
+        Ok(OpCallOutcome::Sync(result))
     }
 
     /// Get number of registered ops.
@@ -343,5 +441,83 @@ mod tests {
         let value = result.unwrap();
         assert_eq!(value["received"][0], "hello");
         assert_eq!(value["received"][1], 42);
+    }
+
+    #[test]
+    fn test_op_call_outcome_sync() {
+        let mut registry = OpRegistry::new();
+
+        let handler = Arc::new(|args: Vec<serde_json::Value>| {
+            Ok(serde_json::json!({ "result": args[0].as_i64().unwrap() * 2 }))
+        });
+
+        let op_id = registry
+            .register_op("double".to_string(), OpMode::Sync, vec![], handler)
+            .unwrap();
+
+        let outcome = registry.call_op_outcome(op_id, vec![serde_json::json!(21)]);
+
+        assert!(outcome.is_ok());
+        let outcome = outcome.unwrap();
+        assert!(outcome.is_sync());
+        assert!(!outcome.is_async());
+
+        match outcome {
+            OpCallOutcome::Sync(result) => {
+                let value = result.unwrap();
+                assert_eq!(value["result"], 42);
+            }
+            OpCallOutcome::Async { .. } => panic!("Expected Sync outcome"),
+        }
+    }
+
+    #[test]
+    fn test_op_call_outcome_permission_denied() {
+        let mut registry = OpRegistry::new();
+
+        let handler = Arc::new(|_args: Vec<serde_json::Value>| Ok(serde_json::json!({})));
+
+        let op_id = registry
+            .register_op(
+                "restricted".to_string(),
+                OpMode::Sync,
+                vec![Permission::Net(None)],
+                handler,
+            )
+            .unwrap();
+
+        // Should fail without permission
+        let outcome = registry.call_op_outcome(op_id, vec![]);
+        assert!(outcome.is_err());
+        assert!(outcome.unwrap_err().contains("Permission denied"));
+    }
+
+    #[test]
+    fn test_op_call_outcome_helpers() {
+        use std::future::ready;
+
+        // Test sync helper
+        let sync_outcome = OpCallOutcome::sync(Ok(serde_json::json!(42)));
+        assert!(sync_outcome.is_sync());
+
+        // Test async_eager helper
+        let async_outcome = OpCallOutcome::async_eager(ready(Ok(serde_json::json!(42))));
+        assert!(async_outcome.is_async());
+        match async_outcome {
+            OpCallOutcome::Async { scheduling, .. } => {
+                assert_eq!(scheduling, OpScheduling::Eager);
+            }
+            _ => panic!("Expected Async outcome"),
+        }
+
+        // Test async_lazy helper
+        let async_outcome = OpCallOutcome::async_lazy(ready(Ok(serde_json::json!(42))));
+        assert!(async_outcome.is_async());
+        match async_outcome {
+            OpCallOutcome::Async { scheduling, .. } => {
+                assert_eq!(scheduling, OpScheduling::Lazy);
+            }
+            _ => panic!("Expected Async outcome"),
+        }
     }
 }

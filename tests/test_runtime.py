@@ -1,5 +1,5 @@
 """
-Phase 1 integration tests for the Tokio-based Runtime class.
+Integration tests for the Tokio-based Runtime class.
 
 These tests verify that the new Runtime API can:
 1. Spawn a runtime successfully
@@ -264,13 +264,8 @@ class TestRuntimeEdgeCases:
             runtime.close()
 
 
-# ============================================================================
-# Phase 2: Async Execution Core Tests
-# ============================================================================
-
-
 class TestRuntimeAsync:
-    """Test async evaluation with promises (Phase 2)."""
+    """Test async evaluation with promises."""
 
     @pytest.mark.asyncio
     async def test_eval_async_without_promise(self):
@@ -334,7 +329,7 @@ class TestRuntimeAsync:
 
 
 class TestRuntimeTimeout:
-    """Test timeout functionality (Phase 2)."""
+    """Test timeout functionality."""
 
     @pytest.mark.asyncio
     async def test_eval_async_timeout_success(self):
@@ -376,7 +371,7 @@ class TestRuntimeTimeout:
 
 
 class TestRuntimeAsyncConcurrency:
-    """Test concurrent async runtime operations (Phase 2)."""
+    """Test concurrent async runtime operations."""
 
     @pytest.mark.asyncio
     async def test_multiple_async_evals_sequential(self):
@@ -441,7 +436,7 @@ class TestRuntimeAsyncConcurrency:
 
 
 class TestRuntimeAsyncErrors:
-    """Test error handling in async evaluation (Phase 2)."""
+    """Test error handling in async evaluation."""
 
     @pytest.mark.asyncio
     async def test_eval_async_syntax_error(self):

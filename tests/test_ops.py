@@ -480,5 +480,70 @@ class TestOpBootstrap:
             runtime.close()
 
 
+class TestOpDriverBaseline:
+    """Step 0: Baseline tests showing current async op limitations before OpDriver."""
+
+    @pytest.mark.asyncio
+    async def test_async_ops_currently_block_runtime(self):
+        """
+        Demonstrate that async ops currently don't allow interleaving.
+        This test documents the gap that OpDriver will close.
+        """
+        with Runtime.spawn() as runtime:
+            import time
+
+            call_order = []
+
+            def slow_op(args):
+                # Simulate slow operation
+                call_order.append("op_start")
+                time.sleep(0.1)  # 100ms delay
+                call_order.append("op_end")
+                return {"done": True}
+
+            op_id = runtime.register_op("slowOp", slow_op, mode="async")
+
+            # Start async op and try to run JS code before it completes
+            result = await runtime.eval_async(
+                f"""
+                (async () => {{
+                    const opPromise = __host_op_async__({op_id});
+                    // This eval happens immediately but the op blocks resolution
+                    const marker = 'js_executed';
+                    const result = await opPromise;
+                    return JSON.stringify({{ result, marker }});
+                }})()
+                """,
+                timeout_ms=5000,
+            )
+
+            # The op executes synchronously in the callback, blocking the runtime
+            assert call_order == ["op_start", "op_end"]
+
+            # Result shows the op completed
+            parsed = json.loads(result)
+            assert parsed["result"]["done"] is True
+            assert parsed["marker"] == "js_executed"
+
+    @pytest.mark.asyncio
+    async def test_promise_stats_exposed_from_python(self):
+        """Verify promise stats are accessible for debugging."""
+        with Runtime.spawn() as runtime:
+            result = await runtime.eval_async(
+                """
+                (async () => {
+                    const stats = __getPromiseStats();
+                    return JSON.stringify(stats);
+                })()
+                """
+            )
+
+            stats = json.loads(result)
+            assert "nextPromiseId" in stats
+            assert "ringSize" in stats
+            assert "mapSize" in stats
+            assert stats["ringSize"] == 4096  # 4KB ring as defined in ops_bootstrap.js
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

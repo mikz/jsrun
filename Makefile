@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := all
-sources = python/jsrun tests examples
+sources = python/jsrun tests
 
 # using pip install cargo (via maturin via pip) doesn't get the tty handle
 # so doesn't render color without some help

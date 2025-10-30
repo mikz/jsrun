@@ -4,9 +4,11 @@
 //! Each runtime runs on a dedicated OS thread with a single-threaded Tokio runtime.
 
 use super::config::RuntimeConfig;
+use super::op_driver::{FuturesUnorderedDriver, OpDriver};
 use std::convert::TryInto;
 use std::ffi::c_void;
 use std::sync::mpsc;
+use std::task::{Context, Poll};
 use std::thread;
 use tokio::sync::mpsc as async_mpsc;
 
@@ -66,6 +68,8 @@ pub enum HostCommand {
         timeout_ms: Option<u64>,
         responder: mpsc::Sender<Result<String, String>>,
     },
+    /// Get the number of pending operations
+    GetPendingOps { responder: mpsc::Sender<usize> },
     /// Shutdown the runtime
     Shutdown,
 }
@@ -146,6 +150,7 @@ impl std::fmt::Debug for HostCommand {
                 )
                 .field("timeout_ms", timeout_ms)
                 .finish(),
+            Self::GetPendingOps { .. } => write!(f, "GetPendingOps"),
             Self::Shutdown => write!(f, "Shutdown"),
         }
     }
@@ -163,6 +168,8 @@ pub struct JsRuntimeCore {
     /// Optional bootstrap script to run inside every context
     bootstrap_script: Option<String>,
     op_registry: std::rc::Rc<std::cell::RefCell<super::ops::OpRegistry>>,
+    /// OpDriver for managing async operations (wrapped for interior mutability)
+    op_driver: std::rc::Rc<std::cell::RefCell<FuturesUnorderedDriver>>,
 }
 
 /// Bootstrap JavaScript code for ops system.
@@ -170,6 +177,9 @@ const OPS_BOOTSTRAP: &str = include_str!("ops_bootstrap.js");
 
 /// Embedder slot holding a pointer to the runtime's op registry.
 const REGISTRY_EMBEDDER_SLOT: i32 = 0;
+
+/// Embedder slot holding a pointer to the runtime's op driver.
+const DRIVER_EMBEDDER_SLOT: i32 = 1;
 
 fn get_op_registry(
     scope: &mut rusty_v8::HandleScope,
@@ -188,6 +198,26 @@ fn get_op_registry(
         cloned
     };
     Ok(registry)
+}
+
+fn get_op_driver(
+    scope: &mut rusty_v8::HandleScope,
+) -> Result<std::rc::Rc<std::cell::RefCell<super::op_driver::FuturesUnorderedDriver>>, String> {
+    let context = scope.get_current_context();
+    let ptr = context.get_aligned_pointer_from_embedder_data(DRIVER_EMBEDDER_SLOT);
+    if ptr.is_null() {
+        return Err("Op driver not installed".to_string());
+    }
+    // SAFETY: The pointer was created from Rc::into_raw and is still valid
+    let driver = unsafe {
+        let rc = std::rc::Rc::from_raw(
+            ptr as *const std::cell::RefCell<super::op_driver::FuturesUnorderedDriver>,
+        );
+        let cloned = rc.clone();
+        std::mem::forget(rc); // Don't drop the original Rc
+        cloned
+    };
+    Ok(driver)
 }
 
 fn json_to_v8<'s>(
@@ -337,15 +367,69 @@ fn host_op_async_impl_callback(
         }
     };
 
-    let result = {
-        let registry = registry_rc.borrow();
-        registry.call_op(op_id, json_args)
+    // Get the OpDriver for async operation submission
+    let driver_rc = match get_op_driver(scope) {
+        Ok(driver) => driver,
+        Err(err) => {
+            let msg = rusty_v8::String::new(scope, &err).unwrap();
+            let exception = rusty_v8::Exception::error(scope, msg);
+            scope.throw_exception(exception);
+            return;
+        }
     };
 
-    if let Err(err) = resolve_op_in_scope(scope, promise_id, &result) {
-        let msg = rusty_v8::String::new(scope, &err).unwrap();
-        let exception = rusty_v8::Exception::error(scope, msg);
-        scope.throw_exception(exception);
+    // Get the op outcome (sync or async)
+    let outcome = {
+        let registry = registry_rc.borrow();
+        registry.call_op_outcome(op_id, json_args)
+    };
+
+    match outcome {
+        Ok(super::ops::OpCallOutcome::Sync(result)) => {
+            // Synchronous result - resolve immediately
+            if let Err(err) = resolve_op_in_scope(scope, promise_id, &result) {
+                let msg = rusty_v8::String::new(scope, &err).unwrap();
+                let exception = rusty_v8::Exception::error(scope, msg);
+                scope.throw_exception(exception);
+            }
+        }
+        Ok(super::ops::OpCallOutcome::Async { future, scheduling }) => {
+            // Async operation - submit to driver for polling.
+            // Poll once immediately for eager scheduling; if not ready, queue it.
+            let driver_ref = driver_rc.borrow();
+
+            if driver_ref.is_shutdown() {
+                drop(driver_ref);
+                let shutdown_err = Err("Runtime is shutting down".to_string());
+                if let Err(resolve_err) = resolve_op_in_scope(scope, promise_id, &shutdown_err) {
+                    let msg = rusty_v8::String::new(scope, &resolve_err).unwrap();
+                    let exception = rusty_v8::Exception::error(scope, msg);
+                    scope.throw_exception(exception);
+                }
+                return;
+            }
+
+            let eager_result = driver_ref.submit_op_fallible(op_id, promise_id, scheduling, future);
+            drop(driver_ref);
+
+            // If the future completed eagerly, resolve the promise immediately.
+            if let Some(result) = eager_result {
+                if let Err(resolve_err) = resolve_op_in_scope(scope, promise_id, &result) {
+                    let msg = rusty_v8::String::new(scope, &resolve_err).unwrap();
+                    let exception = rusty_v8::Exception::error(scope, msg);
+                    scope.throw_exception(exception);
+                }
+            }
+        }
+        Err(err) => {
+            // Permission error or op not found - reject the promise
+            let result = Err(err.clone());
+            if let Err(resolve_err) = resolve_op_in_scope(scope, promise_id, &result) {
+                let msg = rusty_v8::String::new(scope, &resolve_err).unwrap();
+                let exception = rusty_v8::Exception::error(scope, msg);
+                scope.throw_exception(exception);
+            }
+        }
     }
 }
 
@@ -523,6 +607,7 @@ impl JsRuntimeCore {
             next_context_id: 0,
             bootstrap_script: config.bootstrap_script.clone(),
             op_registry: std::rc::Rc::new(std::cell::RefCell::new(super::ops::OpRegistry::new())),
+            op_driver: std::rc::Rc::new(std::cell::RefCell::new(FuturesUnorderedDriver::default())),
         };
 
         core.initialize(config)?;
@@ -635,6 +720,9 @@ impl JsRuntimeCore {
                 // Perform microtask checkpoint
                 self.isolate.perform_microtask_checkpoint();
 
+                // Poll the OpDriver for completed async operations
+                let _ = self.poll_op_driver();
+
                 // Check promise state
                 let state = {
                     let scope = &mut rusty_v8::HandleScope::new(&mut self.isolate);
@@ -698,6 +786,57 @@ impl JsRuntimeCore {
         Ok(())
     }
 
+    /// Poll the OpDriver for ready operations and resolve them.
+    ///
+    /// This should be called after draining microtasks to handle completed async ops.
+    pub fn poll_op_driver(&mut self) -> Result<(), String> {
+        use futures::task::noop_waker;
+
+        // Simple waker for polling
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        // Poll for ready operations
+        while let Poll::Ready((promise_id, _op_id, op_result)) =
+            self.op_driver.borrow().poll_ready(&mut cx)
+        {
+            // Convert OpResult to Result
+            let result = op_result.into_result();
+
+            // Resolve the promise in V8
+            let scope = &mut rusty_v8::HandleScope::new(&mut self.isolate);
+            let context = rusty_v8::Local::new(scope, &self.primary_context);
+            let scope = &mut rusty_v8::ContextScope::new(scope, context);
+
+            if let Err(err) = resolve_op_in_scope(scope, promise_id, &result) {
+                eprintln!("Failed to resolve op promise {}: {}", promise_id, err);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Get the number of pending operations in the OpDriver.
+    ///
+    /// This is useful for debugging and monitoring async operation load.
+    pub fn pending_ops(&self) -> usize {
+        self.op_driver.borrow().len()
+    }
+
+    /// Get detailed statistics about in-flight operations.
+    #[allow(dead_code)] // Will be exposed via API when async ops are fully wired
+    pub fn op_driver_stats(&self) -> super::op_driver::OpInflightStats {
+        self.op_driver.borrow().stats()
+    }
+
+    /// Shutdown the OpDriver, canceling any pending operations.
+    ///
+    /// This is called automatically when the runtime is dropped, but can
+    /// be called explicitly to clean up resources earlier.
+    pub fn shutdown_op_driver(&self) {
+        self.op_driver.borrow().shutdown();
+    }
+
     /// Install op bootstrap and host shims into the given context.
     fn bootstrap_ops_for_context(
         &mut self,
@@ -708,10 +847,15 @@ impl JsRuntimeCore {
             let context_local = rusty_v8::Local::new(scope, context);
 
             let registry_ptr = std::rc::Rc::into_raw(self.op_registry.clone());
+            let driver_ptr = std::rc::Rc::into_raw(self.op_driver.clone());
             unsafe {
                 context_local.set_aligned_pointer_in_embedder_data(
                     REGISTRY_EMBEDDER_SLOT,
                     registry_ptr as *mut c_void,
+                );
+                context_local.set_aligned_pointer_in_embedder_data(
+                    DRIVER_EMBEDDER_SLOT,
+                    driver_ptr as *mut c_void,
                 );
             }
 
@@ -785,12 +929,29 @@ impl JsRuntimeCore {
         let scope = &mut rusty_v8::HandleScope::new(&mut self.isolate);
         let context_local = rusty_v8::Local::new(scope, context);
         unsafe {
-            let ptr = context_local.get_aligned_pointer_from_embedder_data(REGISTRY_EMBEDDER_SLOT);
-            if !ptr.is_null() {
-                let _ =
-                    std::rc::Rc::from_raw(ptr as *const std::cell::RefCell<super::ops::OpRegistry>);
+            // Clear registry pointer
+            let registry_ptr =
+                context_local.get_aligned_pointer_from_embedder_data(REGISTRY_EMBEDDER_SLOT);
+            if !registry_ptr.is_null() {
+                let _ = std::rc::Rc::from_raw(
+                    registry_ptr as *const std::cell::RefCell<super::ops::OpRegistry>,
+                );
                 context_local.set_aligned_pointer_in_embedder_data(
                     REGISTRY_EMBEDDER_SLOT,
+                    std::ptr::null_mut(),
+                );
+            }
+
+            // Clear driver pointer
+            let driver_ptr =
+                context_local.get_aligned_pointer_from_embedder_data(DRIVER_EMBEDDER_SLOT);
+            if !driver_ptr.is_null() {
+                let _ = std::rc::Rc::from_raw(
+                    driver_ptr
+                        as *const std::cell::RefCell<super::op_driver::FuturesUnorderedDriver>,
+                );
+                context_local.set_aligned_pointer_in_embedder_data(
+                    DRIVER_EMBEDDER_SLOT,
                     std::ptr::null_mut(),
                 );
             }
@@ -923,6 +1084,9 @@ impl JsRuntimeCore {
                 // Perform microtask checkpoint
                 self.isolate.perform_microtask_checkpoint();
 
+                // Poll the OpDriver for completed async operations
+                let _ = self.poll_op_driver();
+
                 // Check promise state
                 let state = {
                     let scope = &mut rusty_v8::HandleScope::new(&mut self.isolate);
@@ -1039,7 +1203,7 @@ pub fn spawn_runtime_thread(
                             let _ = responder.send(result);
                         }
                         HostCommand::ExecuteModule { url, responder } => {
-                            // Placeholder for Phase 5
+                            // Placeholder
                             let _ = responder.send(Err(format!(
                                 "Module execution not yet implemented: {}",
                                 url
@@ -1047,6 +1211,10 @@ pub fn spawn_runtime_thread(
                         }
                         HostCommand::DrainTasks { responder } => {
                             let result = runtime.drain_tasks();
+                            // Poll the OpDriver after draining microtasks
+                            if result.is_ok() {
+                                let _ = runtime.poll_op_driver();
+                            }
                             let _ = responder.send(result);
                         }
                         HostCommand::OpCall {
@@ -1110,7 +1278,13 @@ pub fn spawn_runtime_thread(
                                 .await;
                             let _ = responder.send(result);
                         }
+                        HostCommand::GetPendingOps { responder } => {
+                            let count = runtime.pending_ops();
+                            let _ = responder.send(count);
+                        }
                         HostCommand::Shutdown => {
+                            // Shutdown the OpDriver before exiting
+                            runtime.shutdown_op_driver();
                             break;
                         }
                     }
@@ -1501,5 +1675,91 @@ mod tests {
 
         let error_message = runtime.eval("globalThis.promiseErrorMessage").unwrap();
         assert_eq!(error_message, "boom");
+    }
+
+    // Step 0: Baseline tests capturing current async op behavior before OpDriver integration
+
+    #[tokio::test]
+    async fn test_async_op_resolves_inline() {
+        // Captures current behavior: async ops resolve immediately via host_op_async_impl_callback
+        let config = RuntimeConfig::default();
+        let tx = spawn_runtime_thread(config).unwrap();
+
+        // Register an async op via command
+        let (register_tx, register_rx) = mpsc::channel();
+        let handler: ops::OpHandler = Arc::new(|args: Vec<serde_json::Value>| {
+            Ok(json!({ "result": args[0].as_i64().unwrap() * 2 }))
+        });
+
+        tx.send(HostCommand::RegisterOp {
+            name: "double".to_string(),
+            mode: OpMode::Async,
+            permissions: vec![],
+            handler,
+            responder: register_tx,
+        })
+        .unwrap();
+
+        let _op_id = register_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("Timeout waiting for op registration")
+            .expect("Op registration failed");
+
+        // Call the async op and verify it resolves inline
+        let (result_tx, result_rx) = mpsc::channel();
+        tx.send(HostCommand::EvalAsync {
+            code: r#"
+                (async () => {
+                    globalThis.asyncResult = null;
+                    __host_op_async__(0, 21).then(result => {
+                        globalThis.asyncResult = result;
+                    });
+                    // Allow microtasks to run
+                    await Promise.resolve();
+                    return JSON.stringify(globalThis.asyncResult);
+                })()
+            "#
+            .to_string(),
+            timeout_ms: None,
+            responder: result_tx,
+        })
+        .unwrap();
+
+        let result = result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("Timeout waiting for result")
+            .expect("Eval failed");
+
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["result"], 42);
+
+        // Shutdown
+        tx.send(HostCommand::Shutdown).unwrap();
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    #[test]
+    fn test_promise_stats_available() {
+        // Verify __getPromiseStats is available for observability
+        let config = RuntimeConfig::default();
+        let mut runtime = JsRuntimeCore::new(&config).unwrap();
+
+        let result = runtime
+            .eval(
+                r#"
+            const stats = __getPromiseStats();
+            JSON.stringify({
+                hasNextId: typeof stats.nextPromiseId === 'number',
+                hasRingSize: typeof stats.ringSize === 'number',
+                hasMapSize: typeof stats.mapSize === 'number'
+            })
+            "#,
+            )
+            .unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["hasNextId"], true);
+        assert_eq!(parsed["hasRingSize"], true);
+        assert_eq!(parsed["hasMapSize"], true);
     }
 }

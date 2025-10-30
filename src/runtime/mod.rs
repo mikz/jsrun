@@ -7,6 +7,7 @@
 pub mod config;
 pub mod context;
 pub mod handle;
+pub mod op_driver;
 pub mod ops;
 pub mod python;
 pub mod runner;

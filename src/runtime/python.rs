@@ -161,6 +161,21 @@ impl Runtime {
         Ok(())
     }
 
+    /// Get the number of pending operations in the OpDriver.
+    ///
+    /// Returns 0 if the runtime has been shut down or if there are no pending operations.
+    /// This is useful for monitoring async operation load and debugging.
+    ///
+    /// Returns:
+    ///     int: Number of pending async operations
+    fn pending_ops(&self) -> PyResult<usize> {
+        let handle_opt = self.handle.borrow();
+        match handle_opt.as_ref() {
+            Some(handle) => Ok(handle.pending_ops()),
+            None => Ok(0),
+        }
+    }
+
     /// Context manager support: __enter__
     fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
         slf

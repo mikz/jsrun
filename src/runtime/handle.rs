@@ -97,6 +97,34 @@ impl RuntimeHandle {
         *self.shutdown.lock().unwrap()
     }
 
+    /// Get the number of pending operations in the OpDriver.
+    ///
+    /// Returns 0 if the runtime has been shut down or if there are no pending operations.
+    /// This is useful for monitoring async operation load and debugging.
+    pub fn pending_ops(&self) -> usize {
+        if *self.shutdown.lock().unwrap() {
+            return 0;
+        }
+
+        let tx = match self.tx.as_ref() {
+            Some(tx) => tx,
+            None => return 0,
+        };
+
+        let (result_tx, result_rx) = mpsc::channel();
+
+        if tx
+            .send(HostCommand::GetPendingOps {
+                responder: result_tx,
+            })
+            .is_err()
+        {
+            return 0;
+        }
+
+        result_rx.recv().unwrap_or(0)
+    }
+
     /// Shut down the runtime gracefully.
     pub fn close(&mut self) -> Result<(), String> {
         let mut shutdown_guard = self.shutdown.lock().unwrap();

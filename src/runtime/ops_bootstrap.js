@@ -96,6 +96,13 @@
   /**
    * Asynchronous op call - returns a promise.
    * The promise will be resolved when the op completes.
+   *
+   * NOTE: This supports Deno-style eager completions. When the OpDriver is fully
+   * integrated, __host_op_async_impl__ will return a non-undefined value for
+   * operations that complete immediately, allowing us to return a resolved promise
+   * without creating the promise infrastructure.
+   *
+   * For now, all operations go through the async path for backward compatibility.
    */
   function __host_op_async__(opId, ...args) {
     // Allocate new promise ID
