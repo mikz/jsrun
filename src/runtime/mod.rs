@@ -82,11 +82,12 @@ mod tests {
         }
     }
 
+    #[allow(clippy::field_reassign_with_default)]
     #[test]
     fn test_runtime_with_heap_limits() {
-        let config = RuntimeConfig::new()
-            .with_max_heap_size(10 * 1024 * 1024) // 10 MB
-            .with_initial_heap_size(1024 * 1024); // 1 MB
+        let mut config = RuntimeConfig::default();
+        config.max_heap_size = Some(10 * 1024 * 1024); // 10 MB
+        config.initial_heap_size = Some(1024 * 1024); // 1 MB
 
         let handle = RuntimeHandle::spawn(config).unwrap();
 
@@ -95,10 +96,11 @@ mod tests {
         assert_eq!(result.unwrap(), "hello");
     }
 
+    #[allow(clippy::field_reassign_with_default)]
     #[test]
     fn test_runtime_with_bootstrap() {
-        let config =
-            RuntimeConfig::new().with_bootstrap("globalThis.VERSION = '1.0.0';".to_string());
+        let mut config = RuntimeConfig::default();
+        config.bootstrap_script = Some("globalThis.VERSION = '1.0.0';".to_string());
 
         let handle = RuntimeHandle::spawn(config).unwrap();
 

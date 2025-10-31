@@ -60,8 +60,13 @@ impl Runtime {
 #[pymethods]
 impl Runtime {
     #[new]
-    fn py_new() -> PyResult<Self> {
-        Self::init_with_config(RuntimeConfig::default())
+    #[pyo3(signature = (config = None))]
+    fn py_new(config: Option<&RuntimeConfig>) -> PyResult<Self> {
+        let runtime_config = match config {
+            Some(config_py) => config_py.clone(),
+            None => RuntimeConfig::default(),
+        };
+        Self::init_with_config(runtime_config)
     }
 
     #[pyo3(signature = (code, /, *, timeout_ms=None))]

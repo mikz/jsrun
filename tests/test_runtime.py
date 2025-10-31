@@ -474,3 +474,209 @@ class TestRuntimeAsyncErrors:
 
         with pytest.raises(RuntimeError, match="closed"):
             await runtime.eval_async("Promise.resolve(1)")
+
+
+class TestRuntimeConfig:
+    """Tests for RuntimeConfig functionality."""
+
+    def test_runtime_config_default(self):
+        """Test default RuntimeConfig creation."""
+        from jsrun import RuntimeConfig
+
+        config = RuntimeConfig()
+        assert config is not None
+        # Should have default values
+        assert "RuntimeConfig" in repr(config)
+
+    def test_runtime_config_constructor_with_kwargs(self):
+        """Test RuntimeConfig constructor with keyword arguments."""
+        from jsrun import RuntimeConfig
+
+        config = RuntimeConfig(
+            max_heap_size=100 * 1024 * 1024,
+            initial_heap_size=50 * 1024 * 1024,
+            bootstrap='console.log("Bootstrap executed")',
+            timeout=30.0,
+            permissions=[
+                ("timers", None),
+                ("net", "example.com"),
+            ],
+        )
+
+        assert config is not None
+        assert "RuntimeConfig" in repr(config)
+        assert config.max_heap_size == 100 * 1024 * 1024
+        assert config.initial_heap_size == 50 * 1024 * 1024
+        assert config.bootstrap == 'console.log("Bootstrap executed")'
+        assert config.timeout == 30.0
+        assert len(config.permissions) == 2
+
+    def test_runtime_config_property_methods(self):
+        """Test RuntimeConfig with property setters."""
+        from jsrun import RuntimeConfig
+
+        config = RuntimeConfig()
+        config.max_heap_size = 100 * 1024 * 1024
+        config.initial_heap_size = 50 * 1024 * 1024
+        config.bootstrap = 'console.log("Bootstrap executed")'
+        config.timeout = 30.0
+        config.permissions = [
+            ("timers", None),
+            ("net", "example.com"),
+        ]
+
+        assert config is not None
+        assert "RuntimeConfig" in repr(config)
+        assert config.max_heap_size == 100 * 1024 * 1024
+        assert config.initial_heap_size == 50 * 1024 * 1024
+        assert config.bootstrap == 'console.log("Bootstrap executed")'
+        assert config.timeout == 30.0
+        assert len(config.permissions) == 2
+
+    def test_runtime_config_with_bootstrap(self):
+        """Test Runtime with bootstrap script."""
+        from jsrun import Runtime, RuntimeConfig
+
+        config = RuntimeConfig(bootstrap="globalThis.bootstrapped = true;")
+
+        with Runtime(config) as runtime:
+            result = runtime.eval("bootstrapped")
+            assert result == "true"
+
+    def test_runtime_config_without_bootstrap(self):
+        """Test Runtime without bootstrap script (should not have bootstrapped variable)."""
+        from jsrun import Runtime, RuntimeConfig
+
+        config = RuntimeConfig()  # No bootstrap
+
+        with Runtime(config) as runtime:
+            # Should not have bootstrapped variable
+            result = runtime.eval("typeof bootstrapped")
+            assert result == "undefined"
+
+    def test_runtime_config_permissions(self):
+        """Test RuntimeConfig permission methods."""
+        from jsrun import RuntimeConfig
+
+        # Test timers permission
+        config1 = RuntimeConfig()
+        config1.permissions = [("timers", None)]
+        assert config1 is not None
+        assert len(config1.permissions) == 1
+
+        # Test net permission with scope
+        config2 = RuntimeConfig()
+        config2.permissions = [("net", "example.com")]
+        assert config2 is not None
+        assert len(config2.permissions) == 1
+
+        # Test file permission with scope
+        config3 = RuntimeConfig()
+        config3.permissions = [("file", "/tmp")]
+        assert config3 is not None
+        assert len(config3.permissions) == 1
+
+        # Test file permission without scope
+        config4 = RuntimeConfig()
+        config4.permissions = [("file", None)]
+        assert config4 is not None
+        assert len(config4.permissions) == 1
+
+    def test_runtime_config_invalid_permission(self):
+        """Test RuntimeConfig with invalid permission."""
+        from jsrun import RuntimeConfig
+
+        config = RuntimeConfig()
+
+        with pytest.raises(ValueError, match="Unknown permission"):
+            config.permissions = [("invalid_permission", None)]
+
+    def test_runtime_config_timeout_formats(self):
+        """Test RuntimeConfig timeout with different formats."""
+        from jsrun import RuntimeConfig
+
+        # Test float timeout
+        config1 = RuntimeConfig(timeout=30.5)
+        assert config1 is not None
+        assert config1.timeout == 30.5
+
+        # Test integer timeout
+        config2 = RuntimeConfig(timeout=60)
+        assert config2 is not None
+        assert config2.timeout == 60.0
+
+        # Test timedelta timeout
+        import datetime
+
+        config3 = RuntimeConfig(timeout=datetime.timedelta(seconds=45))
+        assert config3 is not None
+        assert config3.timeout == 45.0
+
+    def test_runtime_config_invalid_timeout(self):
+        """Test RuntimeConfig with invalid timeout."""
+        from jsrun import RuntimeConfig
+
+        config = RuntimeConfig()
+
+        with pytest.raises(ValueError, match="Timeout must be a number"):
+            config.timeout = "invalid"
+
+    def test_runtime_with_config(self):
+        """Test Runtime creation with RuntimeConfig."""
+        from jsrun import Runtime, RuntimeConfig
+
+        config = RuntimeConfig(bootstrap="globalThis.configured = true;")
+
+        with Runtime(config) as runtime:
+            result = runtime.eval("configured")
+            assert result == "true"
+
+    def test_runtime_without_config(self):
+        """Test Runtime creation without RuntimeConfig (default behavior)."""
+        from jsrun import Runtime
+
+        # Should work the same as before
+        with Runtime() as runtime:
+            result = runtime.eval("2 + 2")
+            assert result == "4"
+
+    def test_runtime_config_property_chaining(self):
+        """Test that RuntimeConfig property setters work correctly."""
+        from jsrun import RuntimeConfig
+
+        config = RuntimeConfig()
+        config.max_heap_size = 100 * 1024 * 1024
+        config.initial_heap_size = 50 * 1024 * 1024
+        config.bootstrap = 'console.log("property chaining")'
+        config.timeout = 30.0
+        config.permissions = [("timers", None)]
+
+        assert config is not None
+        assert config.max_heap_size == 100 * 1024 * 1024
+        assert config.initial_heap_size == 50 * 1024 * 1024
+        assert config.bootstrap == 'console.log("property chaining")'
+        assert config.timeout == 30.0
+        assert len(config.permissions) == 1
+
+    def test_runtime_config_multiple_instances(self):
+        """Test that multiple RuntimeConfig instances are independent."""
+        from jsrun import Runtime, RuntimeConfig
+
+        config1 = RuntimeConfig(bootstrap="globalThis.instance1 = true;")
+        config2 = RuntimeConfig(bootstrap="globalThis.instance2 = true;")
+
+        with Runtime(config1) as runtime1:
+            result1 = runtime1.eval("instance1")
+            assert result1 == "true"
+
+            # instance2 should not be defined in runtime1
+            result2 = runtime1.eval("typeof instance2")
+            assert result2 == "undefined"
+
+        with Runtime(config2) as runtime2:
+            result1 = runtime2.eval("instance2")
+            assert result1 == "true"
+
+            # instance1 should not be defined in runtime2
+            result2 = runtime2.eval("typeof instance1")
+            assert result2 == "undefined"

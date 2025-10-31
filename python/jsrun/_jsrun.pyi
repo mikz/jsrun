@@ -14,28 +14,103 @@ from typing import (
 
 __all__ = [
     "Runtime",
-    "JavaScriptError",
-    "PromiseTimeoutError",
-    "V8Error",
+    "RuntimeConfig",
 ]
 
-# Exception hierarchy
-class JavaScriptError(Exception):
-    """Exception raised when a JavaScript function throws an error."""
-
-    ...
-
-class PromiseTimeoutError(Exception):
-    """Exception raised when a promise times out during await."""
-
-    ...
-
-class V8Error(Exception):
-    """Base exception for V8 errors."""
-
-    ...
-
 # Core runtime types
+
+class RuntimeConfig:
+    """
+    Configuration for JavaScript runtime instances.
+
+    Use this to configure heap limits, execution timeouts, bootstrap scripts,
+    and permissions before creating a Runtime.
+    """
+
+    def __init__(
+        self,
+        max_heap_size: Optional[int] = None,
+        initial_heap_size: Optional[int] = None,
+        bootstrap: Optional[str] = None,
+        timeout: Optional[float | int] = None,
+        permissions: Optional[List[Tuple[str, Optional[str]]]] = None,
+    ) -> None:
+        """
+        Create a new runtime configuration.
+
+        Args:
+            max_heap_size: Maximum heap size in bytes
+            initial_heap_size: Initial heap size in bytes
+            bootstrap: JavaScript source code to execute on startup
+            timeout: Execution timeout in seconds (float or int)
+            permissions: List of permission tuples [(kind, scope), ...]
+        """
+        ...
+
+    @property
+    def max_heap_size(self) -> Optional[int]:
+        """Maximum heap size in bytes."""
+        ...
+
+    @max_heap_size.setter
+    def max_heap_size(self, bytes: int) -> None:
+        """Set maximum heap size in bytes."""
+        ...
+
+    @property
+    def initial_heap_size(self) -> Optional[int]:
+        """Initial heap size in bytes."""
+        ...
+
+    @initial_heap_size.setter
+    def initial_heap_size(self, bytes: int) -> None:
+        """Set initial heap size in bytes."""
+        ...
+
+    @property
+    def bootstrap(self) -> Optional[str]:
+        """Bootstrap script to execute on runtime startup."""
+        ...
+
+    @bootstrap.setter
+    def bootstrap(self, source: str) -> None:
+        """Set bootstrap script to execute on runtime startup."""
+        ...
+
+    @property
+    def timeout(self) -> Optional[float]:
+        """Execution timeout in seconds."""
+        ...
+
+    @timeout.setter
+    def timeout(self, timeout: float | int) -> None:
+        """
+        Set execution timeout.
+
+        Args:
+            timeout: Timeout in seconds (float or int)
+        """
+        ...
+
+    @property
+    def permissions(self) -> List[Tuple[str, Optional[str]]]:
+        """List of permission tuples [(kind, scope), ...]."""
+        ...
+
+    @permissions.setter
+    def permissions(self, permissions: List[Tuple[str, Optional[str]]]) -> None:
+        """
+        Set permissions for the runtime.
+
+        Args:
+            permissions: List of permission tuples [(kind, scope), ...]
+
+        Raises:
+            ValueError: If any permission kind is not recognized
+        """
+        ...
+
+    def __repr__(self) -> str: ...
 
 class Runtime:
     """
@@ -45,7 +120,7 @@ class Runtime:
     and provides async-first JavaScript execution with promise support.
     """
 
-    def __init__(self) -> None: ...
+    def __init__(self, config: Optional[RuntimeConfig] = None) -> None: ...
     def eval(self, code: str) -> str:
         """
         Evaluate JavaScript code synchronously.

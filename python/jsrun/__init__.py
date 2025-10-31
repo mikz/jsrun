@@ -1,13 +1,11 @@
 # Import all symbols from the compiled extension module
 from ._jsrun import (
-    JavaScriptError,
-    PromiseTimeoutError,
     Runtime,
+    RuntimeConfig,
 )
 
 # Re-export for type checkers
 __all__ = [
     "Runtime",
-    "JavaScriptError",
-    "PromiseTimeoutError",
+    "RuntimeConfig",
 ]
