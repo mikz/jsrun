@@ -1,10 +1,11 @@
 """
-Tests for Op System
+Integration coverage for the JS <-> Python op bridge.
 
-This module tests the operations (ops) system that allows Python code to expose
-functions to JavaScript with permission checking and sync/async support.
+These tests focus on registering handlers, invoking them from JavaScript, and
+demonstrating how Python-side guards can enforce policy with the revamped API.
 """
 
+import asyncio
 import json
 import pytest
 from jsrun import Runtime
@@ -15,7 +16,7 @@ class TestOpRegistration:
 
     def test_register_sync_op(self):
         """Test registering a synchronous op."""
-        runtime = Runtime.spawn()
+        runtime = Runtime()
         try:
 
             def add_numbers(args):
@@ -29,10 +30,10 @@ class TestOpRegistration:
 
     def test_register_async_op(self):
         """Test registering an asynchronous op."""
-        runtime = Runtime.spawn()
+        runtime = Runtime()
         try:
 
-            def fetch_data(args):
+            async def fetch_data(args):
                 return {"data": "fetched"}
 
             op_id = runtime.register_op("fetch", fetch_data, mode="async")
@@ -41,24 +42,63 @@ class TestOpRegistration:
         finally:
             runtime.close()
 
-    def test_register_op_with_permissions(self):
-        """Test registering an op with permissions."""
-        runtime = Runtime.spawn()
+    def test_register_mode_mismatch_sync(self):
+        runtime = Runtime()
         try:
 
-            def read_file(args):
+            async def handler(args):
+                return args
+
+            with pytest.raises(RuntimeError):
+                runtime.register_op("asyncWrong", handler, mode="sync")
+        finally:
+            runtime.close()
+
+    def test_register_mode_mismatch_async(self):
+        runtime = Runtime()
+        try:
+
+            def handler(args):
+                return args
+
+            with pytest.raises(RuntimeError):
+                runtime.register_op("syncWrong", handler, mode="async")
+        finally:
+            runtime.close()
+
+    def test_register_op_with_custom_guard(self):
+        """Python handlers can enforce their own policy."""
+        runtime = Runtime()
+        try:
+
+            def read_file(path):
+                if not str(path).startswith("/tmp"):
+                    raise RuntimeError("Permission denied")
                 return "file content"
 
-            op_id = runtime.register_op(
-                "readFile", read_file, mode="sync", permissions=["file:/tmp"]
-            )
+            op_id = runtime.register_op("readFile", read_file, mode="sync")
             assert isinstance(op_id, int)
+
+            allowed = runtime.eval(f"__host_op_sync__({op_id}, '/tmp/allowed.txt')")
+            assert allowed == "file content"
+
+            denied = runtime.eval(
+                f"""
+                try {{
+                    __host_op_sync__({op_id}, '/etc/passwd');
+                    'ok';
+                }} catch (err) {{
+                    err && err.message ? err.message : String(err);
+                }}
+                """
+            )
+            assert "Permission denied" in denied
         finally:
             runtime.close()
 
     def test_register_multiple_ops(self):
         """Test registering multiple ops."""
-        runtime = Runtime.spawn()
+        runtime = Runtime()
         try:
 
             def op1(args):
@@ -83,7 +123,7 @@ class TestOpRegistration:
 
     def test_register_op_invalid_mode(self):
         """Test that invalid mode raises error."""
-        runtime = Runtime.spawn()
+        runtime = Runtime()
         try:
 
             def my_op(args):
@@ -97,7 +137,7 @@ class TestOpRegistration:
 
     def test_register_op_after_close(self):
         """Test that registering op after close raises error."""
-        runtime = Runtime.spawn()
+        runtime = Runtime()
         runtime.close()
 
         def my_op(args):
@@ -113,7 +153,7 @@ class TestOpHandlers:
 
     def test_handler_receives_arguments(self):
         """Test that handler receives arguments correctly."""
-        runtime = Runtime.spawn()
+        runtime = Runtime()
         try:
             received_args = []
 
@@ -132,7 +172,7 @@ class TestOpHandlers:
 
     def test_handler_returns_value(self):
         """Test that handler return values are processed."""
-        runtime = Runtime.spawn()
+        runtime = Runtime()
         try:
 
             def return_value(args):
@@ -145,7 +185,7 @@ class TestOpHandlers:
 
     def test_handler_with_lambda(self):
         """Test registering a lambda as handler."""
-        runtime = Runtime.spawn()
+        runtime = Runtime()
         try:
             op_id = runtime.register_op("double", lambda args: args[0] * 2)
             assert op_id >= 0
@@ -154,7 +194,7 @@ class TestOpHandlers:
 
     def test_handler_with_closure(self):
         """Test registering a closure as handler."""
-        runtime = Runtime.spawn()
+        runtime = Runtime()
         try:
             counter = [0]
 
@@ -169,11 +209,11 @@ class TestOpHandlers:
 
     def test_sync_op_invocation(self):
         """Ensure __host_op_sync__ invokes Python handler."""
-        runtime = Runtime.spawn()
+        runtime = Runtime()
         try:
 
-            def concat(args):
-                return {"joined": "".join(str(x) for x in args)}
+            def concat(a, b, c):
+                return {"joined": "".join(str(x) for x in [a, b, c])}
 
             op_id = runtime.register_op("concat", concat, mode="sync")
 
@@ -188,10 +228,10 @@ class TestOpHandlers:
 
     def test_sync_call_async_op_errors(self):
         """Calling async-mode ops via sync entry point should raise."""
-        runtime = Runtime.spawn()
+        runtime = Runtime()
         try:
 
-            def async_like(args):
+            async def async_like(args):
                 return "value"
 
             op_id = runtime.register_op("asyncOnly", async_like, mode="async")
@@ -214,10 +254,10 @@ class TestOpHandlers:
     @pytest.mark.asyncio
     async def test_async_op_invocation(self):
         """Ensure __host_op_async__ resolves with handler result."""
-        with Runtime.spawn() as runtime:
+        with Runtime() as runtime:
 
-            def collect(args):
-                return {"count": len(args), "data": args}
+            async def collect(a, b, c):
+                return {"count": 3, "data": [a, b, c]}
 
             op_id = runtime.register_op("collect", collect, mode="async")
 
@@ -235,180 +275,117 @@ class TestOpHandlers:
             assert payload["data"] == [1, 2, 3]
 
 
-class TestOpPermissions:
-    """Test op permission system."""
+class TestBindFunction:
+    """High-level binding helpers."""
 
-    def test_permission_timers(self):
-        """Test registering op with timers permission."""
-        runtime = Runtime.spawn()
+    def test_bind_sync_function(self):
+        runtime = Runtime()
         try:
 
-            def set_timeout(args):
-                return "timeout_id"
+            def add(a, b):
+                return a + b
 
-            op_id = runtime.register_op(
-                "setTimeout", set_timeout, permissions=["timers"]
+            runtime.bind_function("addValues", add)
+            result = runtime.eval("addValues(2, 3)")
+            assert result == "5"
+        finally:
+            runtime.close()
+
+    @pytest.mark.asyncio
+    async def test_bind_async_function(self):
+        with Runtime() as runtime:
+
+            async def multiply(a, b):
+                await asyncio.sleep(0)
+                return a * b
+
+            runtime.bind_function("pyMultiply", multiply)
+            result = await runtime.eval_async(
+                """
+                (async () => {
+                    return await pyMultiply(3, 4);
+                })()
+                """
             )
-            assert op_id >= 0
-        finally:
-            runtime.close()
+            assert result == "12"
 
-    def test_permission_net_all(self):
-        """Test registering op with net permission (all hosts)."""
-        runtime = Runtime.spawn()
+
+class TestOpGuarding:
+    """Demonstrate Python-level permission enforcement."""
+
+    def test_sync_guard_blocks_disallowed_calls(self):
+        runtime = Runtime()
         try:
+            allowed_prefix = "/tmp"
 
-            def fetch(args):
-                return "response"
+            def read_file(path):
+                if not path.startswith(allowed_prefix):
+                    raise RuntimeError("Permission denied")
+                return f"read:{path}"
 
-            op_id = runtime.register_op("fetch", fetch, permissions=["net:"])
-            assert op_id >= 0
-        finally:
-            runtime.close()
+            op_id = runtime.register_op("readFile", read_file)
 
-    def test_permission_net_specific_host(self):
-        """Test registering op with net permission for specific host."""
-        runtime = Runtime.spawn()
-        try:
+            allowed = runtime.eval(f"__host_op_sync__({op_id}, '/tmp/data')")
+            assert allowed == "read:/tmp/data"
 
-            def fetch_example(args):
-                return "response"
-
-            op_id = runtime.register_op(
-                "fetchExample", fetch_example, permissions=["net:example.com"]
-            )
-            assert op_id >= 0
-        finally:
-            runtime.close()
-
-    def test_permission_file_all(self):
-        """Test registering op with file permission (all paths)."""
-        runtime = Runtime.spawn()
-        try:
-
-            def read_file(args):
-                return "content"
-
-            op_id = runtime.register_op("readFile", read_file, permissions=["file:"])
-            assert op_id >= 0
-        finally:
-            runtime.close()
-
-    def test_permission_file_specific_path(self):
-        """Test registering op with file permission for specific path."""
-        runtime = Runtime.spawn()
-        try:
-
-            def read_tmp(args):
-                return "content"
-
-            op_id = runtime.register_op("readTmp", read_tmp, permissions=["file:/tmp"])
-            assert op_id >= 0
-        finally:
-            runtime.close()
-
-    def test_permission_env(self):
-        """Test registering op with env permission."""
-        runtime = Runtime.spawn()
-        try:
-
-            def get_env(args):
-                return "value"
-
-            op_id = runtime.register_op("getEnv", get_env, permissions=["env"])
-            assert op_id >= 0
-        finally:
-            runtime.close()
-
-    def test_permission_process(self):
-        """Test registering op with process permission."""
-        runtime = Runtime.spawn()
-        try:
-
-            def spawn_process(args):
-                return "pid"
-
-            op_id = runtime.register_op("spawn", spawn_process, permissions=["process"])
-            assert op_id >= 0
-        finally:
-            runtime.close()
-
-    def test_multiple_permissions(self):
-        """Test registering op with multiple permissions."""
-        runtime = Runtime.spawn()
-        try:
-
-            def complex_op(args):
-                return "result"
-
-            op_id = runtime.register_op(
-                "complexOp",
-                complex_op,
-                permissions=["net:api.example.com", "file:/tmp", "env"],
-            )
-            assert op_id >= 0
-        finally:
-            runtime.close()
-
-    def test_custom_permission(self):
-        """Test registering op with custom permission."""
-        runtime = Runtime.spawn()
-        try:
-
-            def custom_op(args):
-                return "result"
-
-            op_id = runtime.register_op(
-                "customOp", custom_op, permissions=["custom:my_permission"]
-            )
-            assert op_id >= 0
-        finally:
-            runtime.close()
-
-    def test_sync_op_permission_denied(self):
-        """Sync ops should throw when permissions are missing."""
-        runtime = Runtime.spawn()
-        try:
-
-            def read_secret(args):
-                return "secret"
-
-            op_id = runtime.register_op(
-                "readSecret", read_secret, permissions=["file:/secure"]
-            )
-
-            result = runtime.eval(
+            denied = runtime.eval(
                 f"""
                 try {{
-                    __host_op_sync__({op_id}, '/secure/secret.txt');
-                    'ok';
+                    __host_op_sync__({op_id}, '/etc/passwd');
                 }} catch (err) {{
                     err && err.message ? err.message : String(err);
                 }}
                 """
             )
+            assert "Permission denied" in denied
+        finally:
+            runtime.close()
 
-            assert "Permission denied" in result
+    def test_guard_can_mutate_shared_state(self):
+        runtime = Runtime()
+        try:
+            audit_log = []
+
+            def record(*args):
+                audit_log.append(tuple(args))
+                return len(audit_log)
+
+            op_id = runtime.register_op("record", record)
+            count = runtime.eval("__host_op_sync__({0}, 'a', 'b')".format(op_id))
+            assert count == "1"
+            count = runtime.eval("__host_op_sync__({0}, 'c')".format(op_id))
+            assert count == "2"
+            assert audit_log == [("a", "b"), ("c",)]
         finally:
             runtime.close()
 
     @pytest.mark.asyncio
-    async def test_async_op_permission_denied(self):
-        """Async ops should reject when permissions are missing."""
-        with Runtime.spawn() as runtime:
+    async def test_async_guard_blocks_disallowed_calls(self):
+        with Runtime() as runtime:
+            allowed_hosts = {"https://example.com"}
 
-            def fetch_data(args):
-                return {"ok": True}
+            async def fetch(url):
+                if url not in allowed_hosts:
+                    raise RuntimeError("Permission denied")
+                return {"url": url}
 
-            op_id = runtime.register_op(
-                "fetchData", fetch_data, mode="async", permissions=["net:example.com"]
+            op_id = runtime.register_op("fetch", fetch, mode="async")
+
+            allowed = await runtime.eval_async(
+                f"""
+                (async () => {{
+                    const value = await __host_op_async__({op_id}, 'https://example.com');
+                    return JSON.stringify(value);
+                }})()
+                """
             )
+            assert json.loads(allowed)["url"] == "https://example.com"
 
-            result = await runtime.eval_async(
+            denied = await runtime.eval_async(
                 f"""
                 (async () => {{
                     try {{
-                        await __host_op_async__({op_id}, 'https://example.com/');
+                        await __host_op_async__({op_id}, 'https://forbidden.test');
                         return 'ok';
                     }} catch (err) {{
                         return err && err.message ? err.message : String(err);
@@ -416,8 +393,7 @@ class TestOpPermissions:
                 }})()
                 """
             )
-
-            assert "Permission denied" in result
+            assert "Permission denied" in denied
 
 
 class TestContextManager:
@@ -425,7 +401,7 @@ class TestContextManager:
 
     def test_ops_work_with_context_manager(self):
         """Test that ops work correctly with context manager."""
-        with Runtime.spawn() as runtime:
+        with Runtime() as runtime:
 
             def my_op(args):
                 return "ok"
@@ -439,111 +415,14 @@ class TestOpBootstrap:
 
     def test_op_globals_exist(self):
         """Test that op system globals are available in JavaScript."""
-        runtime = Runtime.spawn()
+        runtime = Runtime()
         try:
-            # Check if the op bootstrap globals exist
             result = runtime.eval("typeof __host_op_sync__")
             assert result == "function"
 
             result = runtime.eval("typeof __host_op_async__")
             assert result == "function"
-
-            result = runtime.eval("typeof __resolveOp")
-            assert result == "function"
         finally:
             runtime.close()
 
-    def test_promise_stats_available(self):
-        """Test that promise registry stats are available."""
-        runtime = Runtime.spawn()
-        try:
-            result = runtime.eval("typeof __getPromiseStats")
-            assert result == "function"
-
-            # Call the stats function
-            result = runtime.eval("""
-                const stats = __getPromiseStats();
-                JSON.stringify({
-                    hasNextId: typeof stats.nextPromiseId === 'number',
-                    hasRingSize: typeof stats.ringSize === 'number',
-                    hasMapSize: typeof stats.mapSize === 'number'
-                })
-            """)
-
-            import json
-
-            stats = json.loads(result)
-            assert stats["hasNextId"] is True
-            assert stats["hasRingSize"] is True
-            assert stats["hasMapSize"] is True
-        finally:
-            runtime.close()
-
-
-class TestOpDriverBaseline:
-    """Step 0: Baseline tests showing current async op limitations before OpDriver."""
-
-    @pytest.mark.asyncio
-    async def test_async_ops_currently_block_runtime(self):
-        """
-        Demonstrate that async ops currently don't allow interleaving.
-        This test documents the gap that OpDriver will close.
-        """
-        with Runtime.spawn() as runtime:
-            import time
-
-            call_order = []
-
-            def slow_op(args):
-                # Simulate slow operation
-                call_order.append("op_start")
-                time.sleep(0.1)  # 100ms delay
-                call_order.append("op_end")
-                return {"done": True}
-
-            op_id = runtime.register_op("slowOp", slow_op, mode="async")
-
-            # Start async op and try to run JS code before it completes
-            result = await runtime.eval_async(
-                f"""
-                (async () => {{
-                    const opPromise = __host_op_async__({op_id});
-                    // This eval happens immediately but the op blocks resolution
-                    const marker = 'js_executed';
-                    const result = await opPromise;
-                    return JSON.stringify({{ result, marker }});
-                }})()
-                """,
-                timeout_ms=5000,
-            )
-
-            # The op executes synchronously in the callback, blocking the runtime
-            assert call_order == ["op_start", "op_end"]
-
-            # Result shows the op completed
-            parsed = json.loads(result)
-            assert parsed["result"]["done"] is True
-            assert parsed["marker"] == "js_executed"
-
-    @pytest.mark.asyncio
-    async def test_promise_stats_exposed_from_python(self):
-        """Verify promise stats are accessible for debugging."""
-        with Runtime.spawn() as runtime:
-            result = await runtime.eval_async(
-                """
-                (async () => {
-                    const stats = __getPromiseStats();
-                    return JSON.stringify(stats);
-                })()
-                """
-            )
-
-            stats = json.loads(result)
-            assert "nextPromiseId" in stats
-            assert "ringSize" in stats
-            assert "mapSize" in stats
-            assert stats["ringSize"] == 4096  # 4KB ring as defined in ops_bootstrap.js
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
+    # Async guard support will be reintroduced once host ops gain driver support.

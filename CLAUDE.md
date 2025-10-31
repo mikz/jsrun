@@ -91,7 +91,7 @@ The main Python thread communicates with runtime threads via message passing (`H
 
 ### V8 Platform Initialization
 
-V8 requires exactly one global platform instance. The code uses `OnceCell` to ensure `initialize_platform_once()` is safe to call multiple times. Always call this before creating runtimes (it's done automatically in `Runtime.spawn()`).
+V8 requires exactly one global platform instance. The code uses `OnceCell` to ensure `initialize_platform_once()` is safe to call multiple times. Always call this before creating runtimes (it's done automatically in `Runtime()`).
 
 ## Important Implementation Details
 
@@ -146,7 +146,7 @@ When adding features, add tests at both layers.
 ```python
 from jsrun import Runtime
 
-with Runtime.spawn() as runtime:
+with Runtime() as runtime:
     result = runtime.eval("2 + 2")
 ```
 
@@ -155,7 +155,7 @@ with Runtime.spawn() as runtime:
 import asyncio
 
 async def main():
-    with Runtime.spawn() as runtime:
+    with Runtime() as runtime:
         result = await runtime.eval_async(
             "Promise.resolve(42)",
             timeout_ms=1000
@@ -199,7 +199,7 @@ op_id = runtime.register_op("myOp", my_host_function, mode="sync")
 
 2. **Mixing threads with V8**: V8 isolates are NOT Send. All V8 operations must happen on the runtime thread.
 
-3. **Forgetting V8 platform init**: While `Runtime.spawn()` handles this, raw Rust usage requires calling `initialize_platform_once()` first.
+3. **Forgetting V8 platform init**: While `Runtime()` handles this, raw Rust usage requires calling `initialize_platform_once()` first.
 
 4. **Op permission mismatches**: Ops requiring permissions will fail if runtime not granted those permissions via `RuntimeConfig`.
 

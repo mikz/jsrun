@@ -12,19 +12,12 @@ pyo3::create_exception!(v8, PromiseTimeoutError, pyo3::exceptions::PyException);
 pyo3::create_exception!(v8, V8Error, pyo3::exceptions::PyException);
 
 // Module-specific exceptions
-pyo3::create_exception!(v8, ModuleError, V8Error);
-pyo3::create_exception!(v8, ModuleCompileError, ModuleError);
-pyo3::create_exception!(v8, ModuleInstantiationError, ModuleError);
-pyo3::create_exception!(v8, ModuleEvaluationError, ModuleError);
-
 /// Python jsrun module
 ///
 /// This module provides Python bindings to the jsrun JavaScript runtime.
 #[pymodule]
 fn _jsrun(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    // Tokio-based runtime
     m.add_class::<runtime::python::Runtime>()?;
-    m.add_class::<runtime::context::RuntimeContext>()?;
 
     m.add("JavaScriptError", m.py().get_type::<JavaScriptError>())?;
     m.add(

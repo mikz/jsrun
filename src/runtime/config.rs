@@ -7,6 +7,7 @@ use std::time::Duration;
 
 /// Permission types for runtime operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // Surface area for host integrations even if Rust impls lag behind.
 pub enum Permission {
     /// Allow timer operations (setTimeout, setInterval)
     Timers,
@@ -18,6 +19,7 @@ pub enum Permission {
 
 /// Runtime configuration for a single JavaScript isolate.
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)] // Exposed to Python bindings; some fields are not wired yet in Rust.
 pub struct RuntimeConfig {
     /// Maximum heap size in bytes (None = V8 default)
     pub max_heap_size: Option<usize>,
@@ -35,6 +37,7 @@ pub struct RuntimeConfig {
     pub bootstrap_script: Option<String>,
 }
 
+#[allow(dead_code)] // Builder helpers are kept for external users despite partial Rust usage.
 impl RuntimeConfig {
     /// Create a new runtime configuration with default settings.
     pub fn new() -> Self {

@@ -45,32 +45,7 @@ class Runtime:
     and provides async-first JavaScript execution with promise support.
     """
 
-    @classmethod
-    def spawn(
-        cls,
-        *,
-        heap_limits: Optional[Tuple[int, int]] = None,
-        bootstrap_script: Optional[str] = None,
-    ) -> "Runtime":
-        """
-        Create and start a new JavaScript runtime.
-
-        Args:
-            heap_limits: Optional tuple of (initial_heap_size, max_heap_size) in bytes
-            bootstrap_script: Optional JavaScript code to execute at runtime startup
-
-        Returns:
-            Runtime instance
-
-        Example:
-            >>> runtime = v8.Runtime.spawn()
-            >>> runtime = v8.Runtime.spawn(
-            ...     heap_limits=(10 * 1024 * 1024, 100 * 1024 * 1024),
-            ...     bootstrap_script="globalThis.myGlobal = 42;"
-            ... )
-        """
-        ...
-
+    def __init__(self) -> None: ...
     def eval(self, code: str) -> str:
         """
         Evaluate JavaScript code synchronously.
@@ -89,7 +64,7 @@ class Runtime:
             JavaScriptError: If JavaScript code throws an exception
 
         Example:
-            >>> runtime = v8.Runtime.spawn()
+            >>> runtime = v8.Runtime()
             >>> result = runtime.eval("1 + 1")
             >>> print(result)
             "2"
@@ -116,7 +91,7 @@ class Runtime:
             PromiseTimeoutError: If timeout is exceeded
 
         Example:
-            >>> runtime = v8.Runtime.spawn()
+            >>> runtime = v8.Runtime()
             >>> result = await runtime.eval_async("Promise.resolve(42)")
             >>> print(result)
             "42"
@@ -126,10 +101,9 @@ class Runtime:
     def register_op(
         self,
         name: str,
-        handler: Callable[[List[Any]], Any],
+        handler: Callable[..., Any],
         *,
         mode: str = "sync",
-        permissions: List[str] = [],
     ) -> int:
         """
         Register a host operation that can be called from JavaScript.
@@ -138,7 +112,6 @@ class Runtime:
             name: Operation name (must be unique)
             handler: Python callable that handles the operation
             mode: Operation mode ("sync" or "async")
-            permissions: List of required permission strings
 
         Returns:
             Operation ID that can be used in JavaScript
@@ -147,8 +120,8 @@ class Runtime:
             RuntimeError: If registration fails
 
         Example:
-            >>> def add_handler(args):
-            ...     return args[0] + args[1]
+            >>> def add_handler(a, b):
+            ...     return a + b
             >>> op_id = runtime.register_op("add", add_handler, mode="sync")
             >>> # From JavaScript: __host_op_sync__(op_id, 10, 20)  # Returns 30
         """
@@ -173,6 +146,27 @@ class Runtime:
         """
         ...
 
+    def bind_function(
+        self,
+        name: str,
+        handler: Callable[..., Any],
+    ) -> None:
+        """
+        Expose a Python handler as a global JavaScript function.
+
+        Args:
+            name: Global function name (assigned on `globalThis`)
+            handler: Python callable invoked when JS calls the function
+
+        Example:
+            >>> runtime = v8.Runtime()
+            >>> def add(a, b): return a + b
+            >>> runtime.bind_function("add", add)
+            >>> runtime.eval("add(1, 2)")
+            "3"
+        """
+        ...
+
     def __enter__(self) -> Self:
         """Context manager entry - returns self."""
         ...
@@ -184,74 +178,6 @@ class Runtime:
         exc_tb: Optional[types.TracebackType],
     ) -> bool:
         """Context manager exit - closes the runtime."""
-        ...
-
-    def __repr__(self) -> str: ...
-
-class RuntimeContext:
-    """
-    Execution context for JavaScript code within a Runtime.
-
-    Provides a persistent execution environment with its own global scope.
-    """
-
-    def __init__(self, runtime: Runtime) -> None:
-        """
-        Create a new execution context within the given runtime.
-
-        Args:
-            runtime: The Runtime instance to create the context in
-
-        Example:
-            >>> runtime = v8.Runtime.spawn()
-            >>> ctx = v8.RuntimeContext(runtime)
-        """
-        ...
-
-    def eval(self, code: str) -> str:
-        """
-        Evaluate JavaScript code synchronously in this context.
-
-        Args:
-            code: JavaScript source code to evaluate
-
-        Returns:
-            JSON string representation of the result
-
-        Raises:
-            RuntimeError: If evaluation fails
-            JavaScriptError: If JavaScript code throws an exception
-
-        Example:
-            >>> ctx = v8.RuntimeContext(runtime)
-            >>> result = ctx.eval("var x = 10; x + 5")
-            >>> print(result)
-            "15"
-        """
-        ...
-
-    async def eval_async(self, code: str, *, timeout_ms: Optional[int] = None) -> str:
-        """
-        Evaluate JavaScript code asynchronously in this context.
-
-        Args:
-            code: JavaScript source code to evaluate
-            timeout_ms: Optional timeout in milliseconds
-
-        Returns:
-            JSON string representation of the result
-
-        Raises:
-            RuntimeError: If evaluation fails
-            JavaScriptError: If JavaScript code throws an exception
-            PromiseTimeoutError: If timeout is exceeded
-
-        Example:
-            >>> ctx = v8.RuntimeContext(runtime)
-            >>> result = await ctx.eval_async("Promise.resolve(42)")
-            >>> print(result)
-            "42"
-        """
         ...
 
     def __repr__(self) -> str: ...

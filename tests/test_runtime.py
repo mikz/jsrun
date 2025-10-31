@@ -1,12 +1,9 @@
 """
-Integration tests for the Tokio-based Runtime class.
+High-level integration coverage for the PyO3-backed Runtime.
 
-These tests verify that the new Runtime API can:
-1. Spawn a runtime successfully
-2. Evaluate JavaScript code synchronously
-3. Maintain state across evaluations
-4. Shut down cleanly
-5. Support context manager protocol
+The suite exercises the public Python API end to end, ensuring we can spawn
+isolates, run sync/async JS, preserve state, enforce shutdown semantics, and
+surface promise/timeouts/errors consistently with the Rust core.
 """
 
 import pytest
@@ -17,15 +14,15 @@ class TestRuntimeBasics:
     """Basic Runtime creation and lifecycle tests."""
 
     def test_runtime_spawn(self):
-        """Test that Runtime.spawn() creates a new runtime."""
-        runtime = Runtime.spawn()
+        """Test that Runtime() creates a new runtime."""
+        runtime = Runtime()
         assert runtime is not None
         assert not runtime.is_closed()
         runtime.close()
 
     def test_runtime_eval_simple(self):
         """Test basic JavaScript evaluation."""
-        runtime = Runtime.spawn()
+        runtime = Runtime()
         try:
             result = runtime.eval("2 + 2")
             assert result == "4"
@@ -34,7 +31,7 @@ class TestRuntimeBasics:
 
     def test_runtime_eval_string(self):
         """Test string evaluation."""
-        runtime = Runtime.spawn()
+        runtime = Runtime()
         try:
             result = runtime.eval("'hello world'")
             assert result == "hello world"
@@ -43,7 +40,7 @@ class TestRuntimeBasics:
 
     def test_runtime_eval_expression(self):
         """Test more complex expressions."""
-        runtime = Runtime.spawn()
+        runtime = Runtime()
         try:
             result = runtime.eval("Math.max(10, 20, 30)")
             assert result == "30"
@@ -52,7 +49,7 @@ class TestRuntimeBasics:
 
     def test_runtime_close(self):
         """Test runtime shutdown."""
-        runtime = Runtime.spawn()
+        runtime = Runtime()
         assert not runtime.is_closed()
 
         runtime.close()
@@ -60,14 +57,14 @@ class TestRuntimeBasics:
 
     def test_runtime_close_idempotent(self):
         """Test that close() can be called multiple times safely."""
-        runtime = Runtime.spawn()
+        runtime = Runtime()
         runtime.close()
         runtime.close()  # Should not raise
         assert runtime.is_closed()
 
     def test_runtime_eval_after_close(self):
         """Test that eval after close raises an error."""
-        runtime = Runtime.spawn()
+        runtime = Runtime()
         runtime.close()
 
         with pytest.raises(RuntimeError) as exc_info:
@@ -80,7 +77,7 @@ class TestRuntimeStatePersistence:
 
     def test_variable_persistence(self):
         """Test that variables persist across eval calls."""
-        runtime = Runtime.spawn()
+        runtime = Runtime()
         try:
             runtime.eval("var x = 10;")
             result = runtime.eval("x")
@@ -94,7 +91,7 @@ class TestRuntimeStatePersistence:
 
     def test_function_persistence(self):
         """Test that functions persist across eval calls."""
-        runtime = Runtime.spawn()
+        runtime = Runtime()
         try:
             runtime.eval("function add(a, b) { return a + b; }")
             result = runtime.eval("add(5, 7)")
@@ -104,7 +101,7 @@ class TestRuntimeStatePersistence:
 
     def test_object_persistence(self):
         """Test that objects persist across eval calls."""
-        runtime = Runtime.spawn()
+        runtime = Runtime()
         try:
             runtime.eval("var obj = {name: 'test', value: 42};")
             result = runtime.eval("obj.name")
@@ -121,7 +118,7 @@ class TestRuntimeStatePersistence:
 
     def test_multiple_sequential_evals(self):
         """Test multiple sequential evaluations."""
-        runtime = Runtime.spawn()
+        runtime = Runtime()
         try:
             runtime.eval("var counter = 0;")
 
@@ -138,14 +135,14 @@ class TestRuntimeContextManager:
 
     def test_context_manager_basic(self):
         """Test basic context manager usage."""
-        with Runtime.spawn() as runtime:
+        with Runtime() as runtime:
             result = runtime.eval("3 + 3")
             assert result == "6"
         # Runtime should be closed after exiting context
 
     def test_context_manager_auto_close(self):
         """Test that context manager closes runtime automatically."""
-        runtime = Runtime.spawn()
+        runtime = Runtime()
         assert not runtime.is_closed()
 
         with runtime:
@@ -158,7 +155,7 @@ class TestRuntimeContextManager:
 
     def test_context_manager_with_exception(self):
         """Test that runtime is closed even if exception occurs."""
-        runtime = Runtime.spawn()
+        runtime = Runtime()
 
         try:
             with runtime:
@@ -176,8 +173,8 @@ class TestRuntimeConcurrent:
 
     def test_multiple_runtimes_independent(self):
         """Test that multiple runtimes have independent state."""
-        runtime1 = Runtime.spawn()
-        runtime2 = Runtime.spawn()
+        runtime1 = Runtime()
+        runtime2 = Runtime()
 
         try:
             runtime1.eval("var x = 'runtime1';")
@@ -195,7 +192,7 @@ class TestRuntimeConcurrent:
     def test_sequential_runtime_creation(self):
         """Test creating multiple runtimes sequentially."""
         for i in range(3):
-            runtime = Runtime.spawn()
+            runtime = Runtime()
             try:
                 result = runtime.eval(f"{i} * 2")
                 assert result == str(i * 2)
@@ -208,7 +205,7 @@ class TestRuntimeEdgeCases:
 
     def test_eval_undefined(self):
         """Test evaluation of undefined."""
-        runtime = Runtime.spawn()
+        runtime = Runtime()
         try:
             result = runtime.eval("undefined")
             assert result == "undefined"
@@ -217,7 +214,7 @@ class TestRuntimeEdgeCases:
 
     def test_eval_null(self):
         """Test evaluation of null."""
-        runtime = Runtime.spawn()
+        runtime = Runtime()
         try:
             result = runtime.eval("null")
             assert result == "null"
@@ -226,7 +223,7 @@ class TestRuntimeEdgeCases:
 
     def test_eval_boolean(self):
         """Test evaluation of booleans."""
-        runtime = Runtime.spawn()
+        runtime = Runtime()
         try:
             assert runtime.eval("true") == "true"
             assert runtime.eval("false") == "false"
@@ -235,7 +232,7 @@ class TestRuntimeEdgeCases:
 
     def test_eval_array(self):
         """Test evaluation of arrays."""
-        runtime = Runtime.spawn()
+        runtime = Runtime()
         try:
             result = runtime.eval("[1, 2, 3]")
             # Array toString representation
@@ -245,7 +242,7 @@ class TestRuntimeEdgeCases:
 
     def test_eval_object(self):
         """Test evaluation of objects."""
-        runtime = Runtime.spawn()
+        runtime = Runtime()
         try:
             result = runtime.eval("({a: 1, b: 2})")
             # Object toString representation
@@ -255,7 +252,7 @@ class TestRuntimeEdgeCases:
 
     def test_eval_empty_string(self):
         """Test evaluation of empty statement."""
-        runtime = Runtime.spawn()
+        runtime = Runtime()
         try:
             result = runtime.eval("")
             # Empty script returns undefined
@@ -270,28 +267,28 @@ class TestRuntimeAsync:
     @pytest.mark.asyncio
     async def test_eval_async_without_promise(self):
         """Test async eval with non-promise value."""
-        with Runtime.spawn() as runtime:
+        with Runtime() as runtime:
             result = await runtime.eval_async("10 + 20")
             assert result == "30"
 
     @pytest.mark.asyncio
     async def test_eval_async_with_promise_resolved(self):
         """Test async eval with resolved promise."""
-        with Runtime.spawn() as runtime:
+        with Runtime() as runtime:
             result = await runtime.eval_async("Promise.resolve(42)")
             assert result == "42"
 
     @pytest.mark.asyncio
     async def test_eval_async_with_promise_string(self):
         """Test async eval with promise resolving to string."""
-        with Runtime.spawn() as runtime:
+        with Runtime() as runtime:
             result = await runtime.eval_async("Promise.resolve('async result')")
             assert result == "async result"
 
     @pytest.mark.asyncio
     async def test_eval_async_with_deferred_resolution(self):
         """Test async eval with deferred promise resolution."""
-        with Runtime.spawn() as runtime:
+        with Runtime() as runtime:
             code = """
                 new Promise((resolve) => {
                     // Immediately queued microtask via then
@@ -304,7 +301,7 @@ class TestRuntimeAsync:
     @pytest.mark.asyncio
     async def test_eval_async_promise_chain(self):
         """Test async eval with promise chain."""
-        with Runtime.spawn() as runtime:
+        with Runtime() as runtime:
             code = """
                 Promise.resolve(10)
                     .then(x => x * 2)
@@ -316,16 +313,22 @@ class TestRuntimeAsync:
     @pytest.mark.asyncio
     async def test_eval_async_promise_rejection(self):
         """Test async eval with rejected promise."""
-        with Runtime.spawn() as runtime:
-            with pytest.raises(RuntimeError, match="Promise rejected"):
+        with Runtime() as runtime:
+            with pytest.raises(RuntimeError) as exc_info:
                 await runtime.eval_async("Promise.reject(new Error('test error'))")
+            message = str(exc_info.value)
+            assert "Evaluation failed" in message
+            assert "test error" in message
 
     @pytest.mark.asyncio
     async def test_eval_async_promise_rejection_value(self):
         """Test async eval with rejected promise (non-Error value)."""
-        with Runtime.spawn() as runtime:
-            with pytest.raises(RuntimeError, match="Promise rejected"):
+        with Runtime() as runtime:
+            with pytest.raises(RuntimeError) as exc_info:
                 await runtime.eval_async("Promise.reject('custom error')")
+            message = str(exc_info.value)
+            assert "Evaluation failed" in message
+            assert "custom error" in message
 
 
 class TestRuntimeTimeout:
@@ -334,7 +337,7 @@ class TestRuntimeTimeout:
     @pytest.mark.asyncio
     async def test_eval_async_timeout_success(self):
         """Test that fast promises complete before timeout."""
-        with Runtime.spawn() as runtime:
+        with Runtime() as runtime:
             result = await runtime.eval_async(
                 "Promise.resolve('quick')", timeout_ms=1000
             )
@@ -343,16 +346,19 @@ class TestRuntimeTimeout:
     @pytest.mark.asyncio
     async def test_eval_async_timeout_expiry(self):
         """Test that timeout is enforced for slow operations."""
-        with Runtime.spawn() as runtime:
+        with Runtime() as runtime:
             # Promise that never resolves
             code = "new Promise(() => {})"
-            with pytest.raises(RuntimeError, match="timeout"):
+            with pytest.raises(RuntimeError) as exc_info:
                 await runtime.eval_async(code, timeout_ms=100)
+            message = str(exc_info.value)
+            assert "Evaluation failed" in message
+            assert "pending" in message
 
     @pytest.mark.asyncio
     async def test_eval_async_no_timeout(self):
         """Test async eval without timeout."""
-        with Runtime.spawn() as runtime:
+        with Runtime() as runtime:
             # Should complete without timeout
             result = await runtime.eval_async("Promise.resolve(123)")
             assert result == "123"
@@ -360,7 +366,7 @@ class TestRuntimeTimeout:
     @pytest.mark.asyncio
     async def test_eval_async_timeout_with_promise_chain(self):
         """Test timeout with promise chains that complete in time."""
-        with Runtime.spawn() as runtime:
+        with Runtime() as runtime:
             code = """
                 Promise.resolve()
                     .then(() => Promise.resolve())
@@ -376,7 +382,7 @@ class TestRuntimeAsyncConcurrency:
     @pytest.mark.asyncio
     async def test_multiple_async_evals_sequential(self):
         """Test sequential async evaluations."""
-        with Runtime.spawn() as runtime:
+        with Runtime() as runtime:
             result1 = await runtime.eval_async("Promise.resolve(1)")
             result2 = await runtime.eval_async("Promise.resolve(2)")
             result3 = await runtime.eval_async("Promise.resolve(3)")
@@ -388,8 +394,8 @@ class TestRuntimeAsyncConcurrency:
     @pytest.mark.asyncio
     async def test_multiple_runtimes_async(self):
         """Test multiple runtimes with async operations."""
-        runtime1 = Runtime.spawn()
-        runtime2 = Runtime.spawn()
+        runtime1 = Runtime()
+        runtime2 = Runtime()
 
         try:
             # Run async evals concurrently on different runtimes
@@ -405,7 +411,7 @@ class TestRuntimeAsyncConcurrency:
     @pytest.mark.asyncio
     async def test_mixed_sync_async_eval(self):
         """Test mixing sync and async eval calls."""
-        with Runtime.spawn() as runtime:
+        with Runtime() as runtime:
             # Sync eval
             sync_result = runtime.eval("10 + 10")
             assert sync_result == "20"
@@ -421,7 +427,7 @@ class TestRuntimeAsyncConcurrency:
     @pytest.mark.asyncio
     async def test_async_state_persistence(self):
         """Test that state persists across async evaluations."""
-        with Runtime.spawn() as runtime:
+        with Runtime() as runtime:
             # Set up state
             runtime.eval("var asyncCounter = 0;")
 
@@ -441,26 +447,29 @@ class TestRuntimeAsyncErrors:
     @pytest.mark.asyncio
     async def test_eval_async_syntax_error(self):
         """Test that syntax errors are properly reported in async eval."""
-        with Runtime.spawn() as runtime:
+        with Runtime() as runtime:
             with pytest.raises(RuntimeError, match="failed"):
                 await runtime.eval_async("this is not valid javascript {{{")
 
     @pytest.mark.asyncio
     async def test_eval_async_runtime_error(self):
         """Test that runtime errors in promises are caught."""
-        with Runtime.spawn() as runtime:
+        with Runtime() as runtime:
             code = """
                 new Promise((resolve, reject) => {
                     reject(new Error('Runtime error in promise'));
                 })
             """
-            with pytest.raises(RuntimeError, match="Promise rejected"):
+            with pytest.raises(RuntimeError) as exc_info:
                 await runtime.eval_async(code)
+            message = str(exc_info.value)
+            assert "Evaluation failed" in message
+            assert "Runtime error in promise" in message
 
     @pytest.mark.asyncio
     async def test_eval_async_after_close(self):
         """Test that async eval after close raises an error."""
-        runtime = Runtime.spawn()
+        runtime = Runtime()
         runtime.close()
 
         with pytest.raises(RuntimeError, match="closed"):
