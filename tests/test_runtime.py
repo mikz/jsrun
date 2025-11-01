@@ -499,10 +499,6 @@ class TestRuntimeConfig:
             initial_heap_size=50 * 1024 * 1024,
             bootstrap='console.log("Bootstrap executed")',
             timeout=30.0,
-            permissions=[
-                ("timers", None),
-                ("net", "example.com"),
-            ],
         )
 
         assert config is not None
@@ -511,7 +507,6 @@ class TestRuntimeConfig:
         assert config.initial_heap_size == 50 * 1024 * 1024
         assert config.bootstrap == 'console.log("Bootstrap executed")'
         assert config.timeout == 30.0
-        assert len(config.permissions) == 2
 
     def test_runtime_config_property_methods(self):
         """Test RuntimeConfig with property setters."""
@@ -522,10 +517,6 @@ class TestRuntimeConfig:
         config.initial_heap_size = 50 * 1024 * 1024
         config.bootstrap = 'console.log("Bootstrap executed")'
         config.timeout = 30.0
-        config.permissions = [
-            ("timers", None),
-            ("net", "example.com"),
-        ]
 
         assert config is not None
         assert "RuntimeConfig" in repr(config)
@@ -533,7 +524,6 @@ class TestRuntimeConfig:
         assert config.initial_heap_size == 50 * 1024 * 1024
         assert config.bootstrap == 'console.log("Bootstrap executed")'
         assert config.timeout == 30.0
-        assert len(config.permissions) == 2
 
     def test_runtime_config_with_bootstrap(self):
         """Test Runtime with bootstrap script."""
@@ -556,34 +546,6 @@ class TestRuntimeConfig:
             result = runtime.eval("typeof bootstrapped")
             assert result == "undefined"
 
-    def test_runtime_config_permissions(self):
-        """Test RuntimeConfig permission methods."""
-        from jsrun import RuntimeConfig
-
-        # Test timers permission
-        config1 = RuntimeConfig()
-        config1.permissions = [("timers", None)]
-        assert config1 is not None
-        assert len(config1.permissions) == 1
-
-        # Test net permission with scope
-        config2 = RuntimeConfig()
-        config2.permissions = [("net", "example.com")]
-        assert config2 is not None
-        assert len(config2.permissions) == 1
-
-        # Test file permission with scope
-        config3 = RuntimeConfig()
-        config3.permissions = [("file", "/tmp")]
-        assert config3 is not None
-        assert len(config3.permissions) == 1
-
-        # Test file permission without scope
-        config4 = RuntimeConfig()
-        config4.permissions = [("file", None)]
-        assert config4 is not None
-        assert len(config4.permissions) == 1
-
     def test_runtime_config_initial_requires_max(self):
         """Providing initial heap size without max should raise on runtime creation."""
         from jsrun import Runtime, RuntimeConfig
@@ -605,15 +567,6 @@ class TestRuntimeConfig:
             Runtime(config)
         message = str(exc_info.value).lower()
         assert "cannot exceed" in message
-
-    def test_runtime_config_invalid_permission(self):
-        """Test RuntimeConfig with invalid permission."""
-        from jsrun import RuntimeConfig
-
-        config = RuntimeConfig()
-
-        with pytest.raises(ValueError, match="Unknown permission"):
-            config.permissions = [("invalid_permission", None)]
 
     def test_runtime_config_timeout_formats(self):
         """Test RuntimeConfig timeout with different formats."""
@@ -688,14 +641,12 @@ class TestRuntimeConfig:
         config.initial_heap_size = 50 * 1024 * 1024
         config.bootstrap = 'console.log("property chaining")'
         config.timeout = 30.0
-        config.permissions = [("timers", None)]
 
         assert config is not None
         assert config.max_heap_size == 100 * 1024 * 1024
         assert config.initial_heap_size == 50 * 1024 * 1024
         assert config.bootstrap == 'console.log("property chaining")'
         assert config.timeout == 30.0
-        assert len(config.permissions) == 1
 
     def test_runtime_config_multiple_instances(self):
         """Test that multiple RuntimeConfig instances are independent."""

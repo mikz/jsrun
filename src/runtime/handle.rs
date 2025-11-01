@@ -99,6 +99,94 @@ impl RuntimeHandle {
             .map_err(|_| "Failed to receive op registration result".to_string())?
     }
 
+    pub fn set_module_resolver(&self, handler: Py<PyAny>) -> Result<(), String> {
+        let sender = self.sender()?.clone();
+        let (result_tx, result_rx) = mpsc::channel();
+
+        sender
+            .send(RuntimeCommand::SetModuleResolver {
+                handler,
+                responder: result_tx,
+            })
+            .map_err(|_| "Failed to send set_module_resolver command".to_string())?;
+
+        result_rx
+            .recv()
+            .map_err(|_| "Failed to receive set_module_resolver result".to_string())?
+    }
+
+    pub fn set_module_loader(&self, handler: Py<PyAny>) -> Result<(), String> {
+        let sender = self.sender()?.clone();
+        let (result_tx, result_rx) = mpsc::channel();
+
+        sender
+            .send(RuntimeCommand::SetModuleLoader {
+                handler,
+                responder: result_tx,
+            })
+            .map_err(|_| "Failed to send set_module_loader command".to_string())?;
+
+        result_rx
+            .recv()
+            .map_err(|_| "Failed to receive set_module_loader result".to_string())?
+    }
+
+    pub fn add_static_module(&self, name: String, source: String) -> Result<(), String> {
+        let sender = self.sender()?.clone();
+        let (result_tx, result_rx) = mpsc::channel();
+
+        sender
+            .send(RuntimeCommand::AddStaticModule {
+                name,
+                source,
+                responder: result_tx,
+            })
+            .map_err(|_| "Failed to send add_static_module command".to_string())?;
+
+        result_rx
+            .recv()
+            .map_err(|_| "Failed to receive add_static_module result".to_string())?
+    }
+
+    pub fn eval_module_sync(&self, specifier: &str) -> Result<JSValue, String> {
+        let sender = self.sender()?.clone();
+        let (result_tx, result_rx) = mpsc::channel();
+
+        sender
+            .send(RuntimeCommand::EvalModule {
+                specifier: specifier.to_string(),
+                responder: result_tx,
+            })
+            .map_err(|_| "Failed to send eval_module command".to_string())?;
+
+        result_rx
+            .recv()
+            .map_err(|_| "Failed to receive eval_module result".to_string())?
+    }
+
+    pub async fn eval_module_async(
+        &self,
+        specifier: &str,
+        timeout_ms: Option<u64>,
+        task_locals: Option<TaskLocals>,
+    ) -> Result<JSValue, String> {
+        let sender = self.sender()?.clone();
+        let (result_tx, result_rx) = oneshot::channel();
+
+        sender
+            .send(RuntimeCommand::EvalModuleAsync {
+                specifier: specifier.to_string(),
+                timeout_ms,
+                task_locals,
+                responder: result_tx,
+            })
+            .map_err(|_| "Failed to send eval_module_async command".to_string())?;
+
+        result_rx
+            .await
+            .map_err(|_| "Failed to receive async eval_module result".to_string())?
+    }
+
     pub fn is_shutdown(&self) -> bool {
         *self.shutdown.lock().unwrap()
     }

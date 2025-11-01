@@ -234,6 +234,130 @@ class Runtime:
         """
         ...
 
+    def set_module_resolver(self, resolver: Callable[[str, str], str | None]) -> None:
+        """
+        Set a custom module resolver for JavaScript imports.
+
+        The resolver function is called whenever JavaScript code attempts to import a module.
+        It receives the module specifier and referrer, and should return a fully-qualified
+        URL or None to fall back to simple static resolution.
+
+        Args:
+            resolver: A callable that takes (specifier, referrer) and returns
+                     a fully-qualified URL string or None
+
+        Note:
+            By default, no modules are loadable. You must either call this method,
+            set_module_loader(), or add_static_module() to enable module loading.
+
+        Example:
+            >>> def my_resolver(specifier, referrer):
+            ...     if specifier == "my-lib":
+            ...         return "static:my-lib"
+            ...     return None
+            >>> runtime.set_module_resolver(my_resolver)
+        """
+        ...
+
+    def set_module_loader(self, loader: Callable[[str], Any]) -> None:
+        """
+        Set a custom module loader for JavaScript imports.
+
+        The loader function is called to fetch the source code for a module specifier.
+        It should return the module source code as a string, or a coroutine that resolves
+        to the source code for async loading.
+
+        Args:
+            loader: A callable that takes a module specifier and returns
+                   the module source code as a string, or an awaitable that
+                   resolves to the source code
+
+        Note:
+            By default, no modules are loadable. You must either call this method,
+            set_module_resolver(), or add_static_module() to enable module loading.
+
+        Example:
+            >>> def my_loader(specifier):
+            ...     if specifier == "my-lib":
+            ...         return 'export const value = 42;'
+            ...     raise ValueError(f"Unknown module: {specifier}")
+            >>> runtime.set_module_loader(my_loader)
+        """
+        ...
+
+    def add_static_module(self, name: str, source: str) -> None:
+        """
+        Add a static module that can be imported by JavaScript code.
+
+        This is syntactic sugar for pre-registering modules without custom resolvers.
+        The module can be imported by its bare name (e.g., "lib").
+
+        Args:
+            name: Module name (will be prefixed with "static:")
+            source: JavaScript source code for the module
+
+        Example:
+            >>> runtime.add_static_module("lib", "export const value = 42;")
+            >>> result = runtime.eval_module("lib")
+            >>> print(result["value"])
+            42
+        """
+        ...
+
+    def eval_module(self, specifier: str) -> Any:
+        """
+        Evaluate a JavaScript module synchronously.
+
+        This is a convenience method that blocks on the async module evaluation.
+        For better performance with async modules, use eval_module_async() instead.
+
+        Args:
+            specifier: Module specifier to evaluate
+
+        Returns:
+            The native Python representation of the module namespace (dict-like object)
+
+        Raises:
+            RuntimeError: If module evaluation fails or times out
+            JavaScriptError: If JavaScript code throws an exception
+
+        Example:
+            >>> runtime.add_static_module("lib", "export const value = 42;")
+            >>> result = runtime.eval_module("lib")
+            >>> print(result["value"])
+            42
+        """
+        ...
+
+    async def eval_module_async(
+        self, specifier: str, *, timeout_ms: Optional[int] = None
+    ) -> Any:
+        """
+        Evaluate a JavaScript module asynchronously.
+
+        This method supports async modules and will wait for them to resolve.
+        It's the recommended way to evaluate modules.
+
+        Args:
+            specifier: Module specifier to evaluate
+            timeout_ms: Optional timeout in milliseconds
+
+        Returns:
+            The native Python representation of the module namespace (dict-like object)
+
+        Raises:
+            RuntimeError: If module evaluation fails
+            JavaScriptError: If JavaScript code throws an exception
+            PromiseTimeoutError: If timeout is exceeded
+
+        Example:
+            >>> runtime.add_static_module("lib", "export const value = 42;")
+            >>> result = await runtime.eval_module_async("static:lib")
+            >>> print(result["value"])
+            42
+        """
+        ...
+
     def __enter__(self) -> Self:
         """Context manager entry - returns self."""
         ...

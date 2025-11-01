@@ -8,6 +8,7 @@ pub mod config;
 pub mod conversion;
 pub mod handle;
 pub mod js_value;
+pub mod loader;
 pub mod ops;
 pub mod python;
 pub mod runner;

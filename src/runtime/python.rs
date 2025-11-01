@@ -194,6 +194,93 @@ impl Runtime {
         Ok(())
     }
 
+    fn set_module_resolver(&self, _py: Python<'_>, resolver: Py<PyAny>) -> PyResult<()> {
+        let handle = self
+            .handle
+            .borrow()
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Runtime has been closed"))?
+            .clone();
+
+        handle.set_module_resolver(resolver).map_err(|e| {
+            PyRuntimeError::new_err(format!("Failed to set module resolver: {}", e))
+        })?;
+        Ok(())
+    }
+
+    fn set_module_loader(&self, _py: Python<'_>, loader: Py<PyAny>) -> PyResult<()> {
+        let handle = self
+            .handle
+            .borrow()
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Runtime has been closed"))?
+            .clone();
+
+        handle
+            .set_module_loader(loader)
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to set module loader: {}", e)))?;
+        Ok(())
+    }
+
+    fn add_static_module(&self, _py: Python<'_>, name: String, source: String) -> PyResult<()> {
+        let handle = self
+            .handle
+            .borrow()
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Runtime has been closed"))?
+            .clone();
+
+        handle
+            .add_static_module(name, source)
+            .map_err(|e| PyRuntimeError::new_err(format!("Failed to add static module: {}", e)))?;
+        Ok(())
+    }
+
+    fn eval_module(&self, py: Python<'_>, specifier: &str) -> PyResult<Py<PyAny>> {
+        let handle = self
+            .handle
+            .borrow()
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Runtime has been closed"))?
+            .clone();
+        let specifier_owned = specifier.to_owned();
+        let js_value = py
+            .detach(|| handle.eval_module_sync(&specifier_owned))
+            .map_err(|e| PyRuntimeError::new_err(format!("Module evaluation failed: {}", e)))?;
+        js_value_to_python(py, &js_value)
+    }
+
+    #[pyo3(signature = (specifier, /, *, timeout_ms=None))]
+    fn eval_module_async<'py>(
+        &self,
+        py: Python<'py>,
+        specifier: String,
+        timeout_ms: Option<u64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let handle = self
+            .handle
+            .borrow()
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Runtime has been closed"))?
+            .clone();
+
+        // Capture task_locals from the current async context
+        let task_locals = tokio::get_current_locals(py).ok();
+
+        // Convert the JSValue result to Python after the async operation completes
+        let future = async move {
+            let js_result = handle
+                .eval_module_async(&specifier, timeout_ms, task_locals)
+                .await
+                .map_err(|e| PyRuntimeError::new_err(format!("Module evaluation failed: {}", e)))?;
+
+            // Convert JSValue to Python in the current Python context
+            Python::attach(|py| js_value_to_python(py, &js_result))
+        };
+
+        pyo3_async_runtimes::tokio::future_into_py(py, future)
+    }
+
     fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
         slf
     }

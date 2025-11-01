@@ -6,6 +6,7 @@
 
 use crate::runtime::config::RuntimeConfig;
 use crate::runtime::js_value::{JSValue, LimitTracker, MAX_JS_BYTES, MAX_JS_DEPTH};
+use crate::runtime::loader::PythonModuleLoader;
 use crate::runtime::ops::{python_extension, PythonOpMode, PythonOpRegistry};
 use deno_core::error::CoreError;
 use deno_core::{v8, JsRuntime, PollEventLoopOptions, RuntimeOptions};
@@ -14,6 +15,7 @@ use pyo3::prelude::Py;
 use pyo3::PyAny;
 use pyo3_async_runtimes::TaskLocals;
 use std::collections::HashSet;
+use std::rc::Rc;
 use std::sync::mpsc::Receiver as StdReceiver;
 use std::sync::mpsc::Sender as StdSender;
 use std::sync::mpsc::Sender;
@@ -38,11 +40,34 @@ pub enum RuntimeCommand {
         task_locals: Option<TaskLocals>,
         responder: oneshot::Sender<Result<JSValue, String>>,
     },
+    EvalModule {
+        specifier: String,
+        responder: Sender<Result<JSValue, String>>,
+    },
+    EvalModuleAsync {
+        specifier: String,
+        timeout_ms: Option<u64>,
+        task_locals: Option<TaskLocals>,
+        responder: oneshot::Sender<Result<JSValue, String>>,
+    },
     RegisterPythonOp {
         name: String,
         mode: PythonOpMode,
         handler: Py<PyAny>,
         responder: Sender<Result<u32, String>>,
+    },
+    SetModuleResolver {
+        handler: Py<PyAny>,
+        responder: Sender<Result<(), String>>,
+    },
+    SetModuleLoader {
+        handler: Py<PyAny>,
+        responder: Sender<Result<(), String>>,
+    },
+    AddStaticModule {
+        name: String,
+        source: String,
+        responder: Sender<Result<(), String>>,
     },
     Shutdown {
         responder: Sender<()>,
@@ -90,6 +115,7 @@ pub fn spawn_runtime_thread(
 struct RuntimeCore {
     js_runtime: JsRuntime,
     registry: PythonOpRegistry,
+    module_loader: Rc<PythonModuleLoader>,
     task_locals: Option<TaskLocals>,
     execution_timeout: Option<Duration>,
 }
@@ -98,6 +124,7 @@ impl RuntimeCore {
     fn new(config: RuntimeConfig) -> Result<Self, String> {
         let registry = PythonOpRegistry::new();
         let extension = python_extension(registry.clone());
+        let module_loader = Rc::new(PythonModuleLoader::new());
 
         let RuntimeConfig {
             max_heap_size,
@@ -130,6 +157,7 @@ impl RuntimeCore {
         let mut js_runtime = JsRuntime::new(RuntimeOptions {
             extensions: vec![extension],
             create_params,
+            module_loader: Some(module_loader.clone()),
             ..Default::default()
         });
 
@@ -142,6 +170,7 @@ impl RuntimeCore {
         Ok(Self {
             js_runtime,
             registry,
+            module_loader,
             task_locals: None,
             execution_timeout,
         })
@@ -163,6 +192,7 @@ impl RuntimeCore {
                     // Update task_locals if provided
                     if let Some(ref locals) = task_locals {
                         self.task_locals = Some(locals.clone());
+                        self.module_loader.set_task_locals(locals.clone());
                         // Update the OpState with the new task_locals
                         self.js_runtime
                             .op_state()
@@ -179,6 +209,54 @@ impl RuntimeCore {
                     responder,
                 } => {
                     let result = self.register_python_op(name, mode, handler);
+                    let _ = responder.send(result);
+                }
+                RuntimeCommand::SetModuleResolver { handler, responder } => {
+                    self.module_loader.set_resolver(handler);
+                    if let Some(ref locals) = self.task_locals {
+                        self.module_loader.set_task_locals(locals.clone());
+                    }
+                    let _ = responder.send(Ok(()));
+                }
+                RuntimeCommand::SetModuleLoader { handler, responder } => {
+                    self.module_loader.set_loader(handler);
+                    if let Some(ref locals) = self.task_locals {
+                        self.module_loader.set_task_locals(locals.clone());
+                    }
+                    let _ = responder.send(Ok(()));
+                }
+                RuntimeCommand::AddStaticModule {
+                    name,
+                    source,
+                    responder,
+                } => {
+                    self.module_loader.add_static_module(name, source);
+                    let _ = responder.send(Ok(()));
+                }
+                RuntimeCommand::EvalModule {
+                    specifier,
+                    responder,
+                } => {
+                    let result = self.eval_module_sync(&specifier);
+                    let _ = responder.send(result);
+                }
+                RuntimeCommand::EvalModuleAsync {
+                    specifier,
+                    timeout_ms,
+                    task_locals,
+                    responder,
+                } => {
+                    // Update task_locals if provided
+                    if let Some(ref locals) = task_locals {
+                        self.task_locals = Some(locals.clone());
+                        self.module_loader.set_task_locals(locals.clone());
+                        // Update the OpState with the new task_locals
+                        self.js_runtime
+                            .op_state()
+                            .borrow_mut()
+                            .put(crate::runtime::ops::GlobalTaskLocals(Some(locals.clone())));
+                    }
+                    let result = self.eval_module_async(specifier, timeout_ms).await;
                     let _ = responder.send(result);
                 }
                 RuntimeCommand::Shutdown { responder } => {
@@ -252,6 +330,126 @@ impl RuntimeCore {
         let scope = &mut self.js_runtime.handle_scope();
         let local = deno_core::v8::Local::new(scope, resolved);
         value_to_js_value(scope, local)
+    }
+
+    fn eval_module_sync(&mut self, specifier: &str) -> Result<JSValue, String> {
+        // Try to parse as absolute URL first, if it fails, resolve it as a bare specifier
+        let module_specifier = if specifier.contains(':') || specifier.starts_with('/') {
+            // Already a URL or absolute path
+            deno_core::ModuleSpecifier::parse(specifier)
+                .map_err(|e| format!("Invalid module specifier '{}': {}", specifier, e))?
+        } else {
+            // Bare specifier - resolve relative to a synthetic base
+            let base = deno_core::ModuleSpecifier::parse("jsrun://runtime/")
+                .map_err(|e| format!("Failed to create base URL: {}", e))?;
+            base.join(specifier)
+                .map_err(|e| format!("Failed to resolve module specifier '{}': {}", specifier, e))?
+        };
+
+        // Load the module
+        let module_id =
+            futures::executor::block_on(self.js_runtime.load_main_es_module(&module_specifier))
+                .map_err(|e| format!("Failed to load module '{}': {}", specifier, e))?;
+
+        // Evaluate the module
+        let receiver = self.js_runtime.mod_evaluate(module_id);
+
+        // Poll the runtime until the module evaluation completes
+        let poll_options = PollEventLoopOptions::default();
+        futures::executor::block_on(self.js_runtime.run_event_loop(poll_options))
+            .map_err(|e| e.to_string())?;
+
+        // Wait for the evaluation result - receiver returns Result<(), CoreError>
+        let eval_result = futures::executor::block_on(receiver);
+
+        // Check if evaluation succeeded
+        if let Err(err) = eval_result {
+            return Err(format!("Module evaluation failed: {}", err));
+        }
+
+        // Get the module namespace - must call get_module_namespace before handle_scope
+        let module_namespace = self
+            .js_runtime
+            .get_module_namespace(module_id)
+            .map_err(|e| format!("Failed to get module namespace: {}", e))?;
+        let scope = &mut self.js_runtime.handle_scope();
+        let local = deno_core::v8::Local::new(scope, module_namespace);
+        value_to_js_value(scope, local.into())
+    }
+
+    async fn eval_module_async(
+        &mut self,
+        specifier: String,
+        timeout_ms: Option<u64>,
+    ) -> Result<JSValue, String> {
+        let timeout_ms = timeout_ms.or_else(|| {
+            self.execution_timeout.map(|duration| {
+                let millis = duration.as_millis();
+                if millis > u128::from(u64::MAX) {
+                    u64::MAX
+                } else {
+                    millis as u64
+                }
+            })
+        });
+
+        // Try to parse as absolute URL first, if it fails, resolve it as a bare specifier
+        let module_specifier = if specifier.contains(':') || specifier.starts_with('/') {
+            // Already a URL or absolute path
+            deno_core::ModuleSpecifier::parse(&specifier)
+                .map_err(|e| format!("Invalid module specifier '{}': {}", specifier, e))?
+        } else {
+            // Bare specifier - resolve relative to a synthetic base
+            let base = deno_core::ModuleSpecifier::parse("jsrun://runtime/")
+                .map_err(|e| format!("Failed to create base URL: {}", e))?;
+            base.join(&specifier)
+                .map_err(|e| format!("Failed to resolve module specifier '{}': {}", specifier, e))?
+        };
+
+        // Load the module
+        let module_id = self
+            .js_runtime
+            .load_main_es_module(&module_specifier)
+            .await
+            .map_err(|e| format!("Failed to load module '{}': {}", specifier, e))?;
+
+        // Evaluate the module
+        let receiver = self.js_runtime.mod_evaluate(module_id);
+
+        // Poll the runtime until the module evaluation completes
+        let poll_options = PollEventLoopOptions::default();
+
+        if let Some(ms) = timeout_ms {
+            tokio::time::timeout(
+                Duration::from_millis(ms),
+                self.js_runtime.run_event_loop(poll_options),
+            )
+            .await
+            .map_err(|_| format!("Module evaluation timed out after {}ms", ms))?
+            .map_err(|e| e.to_string())?
+        } else {
+            self.js_runtime
+                .run_event_loop(poll_options)
+                .await
+                .map_err(|e| e.to_string())?
+        };
+
+        // Wait for the evaluation result - receiver returns Result<(), CoreError>
+        let eval_result = receiver.await;
+
+        // Check if evaluation succeeded
+        if let Err(err) = eval_result {
+            return Err(format!("Module evaluation failed: {}", err));
+        }
+
+        // Get the module namespace - must call get_module_namespace before handle_scope
+        let module_namespace = self
+            .js_runtime
+            .get_module_namespace(module_id)
+            .map_err(|e| format!("Failed to get module namespace: {}", e))?;
+        let scope = &mut self.js_runtime.handle_scope();
+        let local = deno_core::v8::Local::new(scope, module_namespace);
+        value_to_js_value(scope, local.into())
     }
 }
 
