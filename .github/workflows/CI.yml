@@ -44,6 +44,9 @@ jobs:
           docker-options: |
             -e V8_FROM_SOURCE=1
             -e GN_ARGS=is_component_build=true
+          before-script-linux: |
+            set -ex
+            yum install -y pkgconfig
       - name: Upload wheels
         uses: actions/upload-artifact@v4
         with:
@@ -111,6 +114,7 @@ jobs:
           path: dist
 
   macos:
+    if: false
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       matrix:
@@ -135,6 +139,7 @@ jobs:
           path: dist
 
   sdist:
+    if: false
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
