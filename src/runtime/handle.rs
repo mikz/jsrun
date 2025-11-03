@@ -187,6 +187,53 @@ impl RuntimeHandle {
             .map_err(|_| "Failed to receive async eval_module result".to_string())?
     }
 
+    // Call a JavaScript function asynchronously.
+    /// Invoke a previously registered JavaScript function on the runtime thread.
+    ///
+    /// The `fn_id` must originate from the same runtime; arguments are transferred as
+    /// `JSValue`s and executed with the runtime's async event loop.
+    pub async fn call_function_async(
+        &self,
+        fn_id: u32,
+        args: Vec<JSValue>,
+        timeout_ms: Option<u64>,
+        task_locals: Option<TaskLocals>,
+    ) -> Result<JSValue, String> {
+        let sender = self.sender()?.clone();
+        let (result_tx, result_rx) = oneshot::channel();
+
+        sender
+            .send(RuntimeCommand::CallFunctionAsync {
+                fn_id,
+                args,
+                timeout_ms,
+                task_locals,
+                responder: result_tx,
+            })
+            .map_err(|_| "Failed to send call_function command".to_string())?;
+
+        result_rx
+            .await
+            .map_err(|_| "Failed to receive function call result".to_string())?
+    }
+
+    /// Release a function handle so the underlying V8 global can be dropped.
+    pub async fn release_function_async(&self, fn_id: u32) -> Result<(), String> {
+        let sender = self.sender()?.clone();
+        let (result_tx, result_rx) = oneshot::channel();
+
+        sender
+            .send(RuntimeCommand::ReleaseFunction {
+                fn_id,
+                responder: result_tx,
+            })
+            .map_err(|_| "Failed to send release_function command".to_string())?;
+
+        result_rx
+            .await
+            .map_err(|_| "Failed to receive release result".to_string())?
+    }
+
     pub fn is_shutdown(&self) -> bool {
         *self.shutdown.lock().unwrap()
     }

@@ -14,7 +14,8 @@ use indexmap::IndexMap;
 use pyo3::prelude::Py;
 use pyo3::PyAny;
 use pyo3_async_runtimes::TaskLocals;
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::mpsc::Receiver as StdReceiver;
 use std::sync::mpsc::Sender as StdSender;
@@ -27,6 +28,12 @@ type InitSignalChannel = (
     StdSender<Result<(), String>>,
     StdReceiver<Result<(), String>>,
 );
+
+/// Stored function with optional receiver for 'this' binding
+struct StoredFunction {
+    function: v8::Global<v8::Function>,
+    receiver: Option<v8::Global<v8::Value>>,
+}
 
 /// Commands sent to the runtime thread.
 pub enum RuntimeCommand {
@@ -68,6 +75,17 @@ pub enum RuntimeCommand {
         name: String,
         source: String,
         responder: Sender<Result<(), String>>,
+    },
+    CallFunctionAsync {
+        fn_id: u32,
+        args: Vec<JSValue>,
+        timeout_ms: Option<u64>,
+        task_locals: Option<TaskLocals>,
+        responder: oneshot::Sender<Result<JSValue, String>>,
+    },
+    ReleaseFunction {
+        fn_id: u32,
+        responder: oneshot::Sender<Result<(), String>>,
     },
     Shutdown {
         responder: Sender<()>,
@@ -118,6 +136,8 @@ struct RuntimeCore {
     module_loader: Rc<PythonModuleLoader>,
     task_locals: Option<TaskLocals>,
     execution_timeout: Option<Duration>,
+    fn_registry: Rc<RefCell<HashMap<u32, StoredFunction>>>,
+    next_fn_id: Rc<RefCell<u32>>,
 }
 
 impl RuntimeCore {
@@ -173,6 +193,8 @@ impl RuntimeCore {
             module_loader,
             task_locals: None,
             execution_timeout,
+            fn_registry: Rc::new(RefCell::new(HashMap::new())),
+            next_fn_id: Rc::new(RefCell::new(0)),
         })
     }
 
@@ -259,7 +281,37 @@ impl RuntimeCore {
                     let result = self.eval_module_async(specifier, timeout_ms).await;
                     let _ = responder.send(result);
                 }
+                RuntimeCommand::CallFunctionAsync {
+                    fn_id,
+                    args,
+                    timeout_ms,
+                    task_locals,
+                    responder,
+                } => {
+                    if let Some(ref locals) = task_locals {
+                        self.task_locals = Some(locals.clone());
+                        self.module_loader.set_task_locals(locals.clone());
+                        self.js_runtime
+                            .op_state()
+                            .borrow_mut()
+                            .put(crate::runtime::ops::GlobalTaskLocals(Some(locals.clone())));
+                    }
+                    let result = self.call_function_async(fn_id, args, timeout_ms).await;
+                    let _ = responder.send(result);
+                }
+                RuntimeCommand::ReleaseFunction { fn_id, responder } => {
+                    let result = self.release_function(fn_id);
+                    let _ = responder.send(result);
+                }
                 RuntimeCommand::Shutdown { responder } => {
+                    let leaked_count = self.fn_registry.borrow().len();
+                    if leaked_count > 0 {
+                        eprintln!(
+                            "[jsrun] Warning: {} function handles not released before shutdown",
+                            leaked_count
+                        );
+                    }
+                    self.fn_registry.borrow_mut().clear();
                     let _ = responder.send(());
                     break;
                 }
@@ -284,7 +336,7 @@ impl RuntimeCore {
 
         let scope = &mut self.js_runtime.handle_scope();
         let local = deno_core::v8::Local::new(scope, global_value);
-        value_to_js_value(scope, local)
+        Self::value_to_js_value(&self.fn_registry, &self.next_fn_id, scope, local)
     }
 
     async fn eval_async(
@@ -329,7 +381,7 @@ impl RuntimeCore {
 
         let scope = &mut self.js_runtime.handle_scope();
         let local = deno_core::v8::Local::new(scope, resolved);
-        value_to_js_value(scope, local)
+        Self::value_to_js_value(&self.fn_registry, &self.next_fn_id, scope, local)
     }
 
     fn eval_module_sync(&mut self, specifier: &str) -> Result<JSValue, String> {
@@ -374,7 +426,7 @@ impl RuntimeCore {
             .map_err(|e| format!("Failed to get module namespace: {}", e))?;
         let scope = &mut self.js_runtime.handle_scope();
         let local = deno_core::v8::Local::new(scope, module_namespace);
-        value_to_js_value(scope, local.into())
+        Self::value_to_js_value(&self.fn_registry, &self.next_fn_id, scope, local.into())
     }
 
     async fn eval_module_async(
@@ -449,154 +501,317 @@ impl RuntimeCore {
             .map_err(|e| format!("Failed to get module namespace: {}", e))?;
         let scope = &mut self.js_runtime.handle_scope();
         let local = deno_core::v8::Local::new(scope, module_namespace);
-        value_to_js_value(scope, local.into())
+        Self::value_to_js_value(&self.fn_registry, &self.next_fn_id, scope, local.into())
+    }
+
+    /// Execute a stored JavaScript function by id with the provided arguments.
+    async fn call_function_async(
+        &mut self,
+        fn_id: u32,
+        args: Vec<JSValue>,
+        timeout_ms: Option<u64>,
+    ) -> Result<JSValue, String> {
+        // Determine timeout
+        let timeout_ms = timeout_ms.or_else(|| {
+            self.execution_timeout.map(|duration| {
+                let millis = duration.as_millis();
+                if millis > u128::from(u64::MAX) {
+                    u64::MAX
+                } else {
+                    millis as u64
+                }
+            })
+        });
+
+        // Look up function in registry and call it
+        let result_global = {
+            let registry = self.fn_registry.borrow();
+            let stored = registry
+                .get(&fn_id)
+                .ok_or_else(|| format!("Function ID {} not found", fn_id))?;
+
+            // Create scope and get function + receiver
+            let scope = &mut self.js_runtime.handle_scope();
+            let func = deno_core::v8::Local::new(scope, &stored.function);
+            let receiver = stored
+                .receiver
+                .as_ref()
+                .map(|r| deno_core::v8::Local::new(scope, r))
+                .unwrap_or_else(|| scope.get_current_context().global(scope).into());
+
+            // Convert arguments from JSValue to v8::Value
+            let mut v8_args = Vec::with_capacity(args.len());
+            for arg in args {
+                let v8_val = match arg {
+                    JSValue::Function { id } => {
+                        // Look up the function in the registry and convert to v8::Function
+                        let stored = registry
+                            .get(&id)
+                            .ok_or_else(|| format!("Function ID {} not found in args", id))?;
+                        deno_core::v8::Local::new(scope, &stored.function).into()
+                    }
+                    _ => {
+                        // Use serde_v8 for other types
+                        deno_core::serde_v8::to_v8(scope, arg)
+                            .map_err(|e| format!("Failed to convert argument: {}", e))?
+                    }
+                };
+                v8_args.push(v8_val);
+            }
+            drop(registry); // Release borrow before function call
+
+            // Call the function
+            let result = func
+                .call(scope, receiver, &v8_args)
+                .ok_or_else(|| "Function call failed".to_string())?;
+
+            // Convert to Global for async resolution
+            deno_core::v8::Global::new(scope, result)
+            // scope is dropped here
+        };
+
+        // Resolve promises (reuse eval_async pattern)
+        let resolve_future = self.js_runtime.resolve(result_global);
+        let poll_options = PollEventLoopOptions::default();
+
+        let resolved = if let Some(ms) = timeout_ms {
+            tokio::time::timeout(
+                Duration::from_millis(ms),
+                self.js_runtime
+                    .with_event_loop_promise(resolve_future, poll_options),
+            )
+            .await
+            .map_err(|_| format!("Function call timed out after {}ms", ms))?
+            .map_err(to_string)?
+        } else {
+            self.js_runtime
+                .with_event_loop_promise(resolve_future, poll_options)
+                .await
+                .map_err(to_string)?
+        };
+
+        // Convert back to JSValue
+        let scope = &mut self.js_runtime.handle_scope();
+        let local = deno_core::v8::Local::new(scope, resolved);
+        Self::value_to_js_value(&self.fn_registry, &self.next_fn_id, scope, local)
+    }
+
+    /// Remove a function from the registry, freeing its V8 global handle.
+    fn release_function(&mut self, fn_id: u32) -> Result<(), String> {
+        let mut registry = self.fn_registry.borrow_mut();
+        registry
+            .remove(&fn_id)
+            .ok_or_else(|| format!("Function ID {} not found", fn_id))?;
+        Ok(())
+    }
+
+    /// Convert a V8 value to JSValue with circular reference detection and limits enforced.
+    fn value_to_js_value<'s>(
+        fn_registry: &Rc<RefCell<HashMap<u32, StoredFunction>>>,
+        next_fn_id: &Rc<RefCell<u32>>,
+        scope: &mut deno_core::v8::HandleScope<'s>,
+        value: deno_core::v8::Local<'s, deno_core::v8::Value>,
+    ) -> Result<JSValue, String> {
+        let mut seen = HashSet::new();
+        let mut tracker = LimitTracker::new(MAX_JS_DEPTH, MAX_JS_BYTES);
+        Self::value_to_js_value_internal(
+            fn_registry,
+            next_fn_id,
+            scope,
+            value,
+            &mut seen,
+            &mut tracker,
+            None,
+        )
+    }
+
+    /// Internal recursive converter with cycle detection and optional receiver capture.
+    fn value_to_js_value_internal<'s>(
+        fn_registry: &Rc<RefCell<HashMap<u32, StoredFunction>>>,
+        next_fn_id: &Rc<RefCell<u32>>,
+        scope: &mut deno_core::v8::HandleScope<'s>,
+        value: deno_core::v8::Local<'s, deno_core::v8::Value>,
+        seen: &mut HashSet<i32>,
+        tracker: &mut LimitTracker,
+        receiver: Option<deno_core::v8::Global<deno_core::v8::Value>>,
+    ) -> Result<JSValue, String> {
+        tracker.enter()?;
+
+        let result = if value.is_null() || value.is_undefined() {
+            tracker.add_bytes(4)?; // "null" or "undefined"
+            Ok(JSValue::Null)
+        } else if value.is_boolean() {
+            tracker.add_bytes(5)?; // "false" (worst case)
+            Ok(JSValue::Bool(value.boolean_value(scope)))
+        } else if value.is_number() {
+            // Handle special numeric values (NaN, ±Infinity)
+            let num_obj = value
+                .to_number(scope)
+                .ok_or_else(|| "Failed to convert value to number".to_string())?;
+            let num_val = num_obj.value();
+            if num_val.is_nan() || num_val.is_infinite() {
+                tracker.add_bytes(24)?;
+                Ok(JSValue::Float(num_val))
+            } else if num_val.fract() == 0.0 && num_val.is_finite() {
+                let as_int = num_val as i64;
+                if as_int as f64 == num_val {
+                    tracker.add_bytes(20)?;
+                    Ok(JSValue::Int(as_int))
+                } else {
+                    tracker.add_bytes(24)?;
+                    Ok(JSValue::Float(num_val))
+                }
+            } else {
+                tracker.add_bytes(24)?;
+                Ok(JSValue::Float(num_val))
+            }
+        } else if value.is_string() {
+            let string = value
+                .to_string(scope)
+                .ok_or_else(|| "Failed to convert string".to_string())?;
+            let rust_str = string.to_rust_string_lossy(scope);
+            tracker.add_bytes(rust_str.len())?;
+            Ok(JSValue::String(rust_str))
+        } else if value.is_big_int() {
+            // Try to convert BigInt to i64, otherwise error
+            let bigint = deno_core::v8::Local::<deno_core::v8::BigInt>::try_from(value)
+                .map_err(|_| "Failed to cast to BigInt".to_string())?;
+            let (val, lossless) = bigint.i64_value();
+            if lossless {
+                tracker.add_bytes(20)?;
+                Ok(JSValue::Int(val))
+            } else {
+                Err("BigInt value too large to represent as i64".to_string())
+            }
+        } else if value.is_function() {
+            // Register function and return proxy ID
+            let func = deno_core::v8::Local::<deno_core::v8::Function>::try_from(value)
+                .map_err(|_| "Failed to cast to function".to_string())?;
+
+            // Create a Global handle to keep the function alive
+            let fn_handle = deno_core::v8::Global::new(scope, func);
+
+            // Register in the function registry
+            let mut registry = fn_registry.borrow_mut();
+            let mut next_id_val = next_fn_id.borrow_mut();
+
+            let fn_id = *next_id_val;
+            *next_id_val += 1;
+
+            registry.insert(
+                fn_id,
+                StoredFunction {
+                    function: fn_handle,
+                    receiver, // Capture receiver for 'this' binding
+                },
+            );
+
+            tracker.add_bytes(8)?; // ID size
+            Ok(JSValue::Function { id: fn_id })
+        } else if value.is_symbol() {
+            Err("Cannot serialize V8 symbol".to_string())
+        } else if value.is_array() {
+            // Check for circular reference using identity hash
+            let obj = deno_core::v8::Local::<deno_core::v8::Object>::try_from(value)
+                .map_err(|_| "Failed to cast array to object".to_string())?;
+            let hash = obj.get_identity_hash().get();
+
+            if !seen.insert(hash) {
+                return Err("Cannot serialize circular reference".to_string());
+            }
+
+            let array = deno_core::v8::Local::<deno_core::v8::Array>::try_from(value)
+                .map_err(|_| "Failed to cast to array".to_string())?;
+            let len = array.length() as usize;
+
+            let mut items = Vec::with_capacity(len);
+            for i in 0..len {
+                let idx = i as u32;
+                let item = array
+                    .get_index(scope, idx)
+                    .ok_or_else(|| format!("Failed to get array index {}", i))?;
+                items.push(Self::value_to_js_value_internal(
+                    fn_registry,
+                    next_fn_id,
+                    scope,
+                    item,
+                    seen,
+                    tracker,
+                    None,
+                )?);
+            }
+
+            seen.remove(&hash);
+            Ok(JSValue::Array(items))
+        } else if value.is_object() {
+            // Check for circular reference using identity hash
+            let obj = deno_core::v8::Local::<deno_core::v8::Object>::try_from(value)
+                .map_err(|_| "Failed to cast to object".to_string())?;
+            let hash = obj.get_identity_hash().get();
+
+            if !seen.insert(hash) {
+                return Err("Cannot serialize circular reference".to_string());
+            }
+
+            // Get property names
+            let prop_names = obj
+                .get_own_property_names(scope, deno_core::v8::GetPropertyNamesArgs::default())
+                .ok_or_else(|| "Failed to get property names".to_string())?;
+
+            let mut map = IndexMap::new();
+            for i in 0..prop_names.length() {
+                let key = prop_names
+                    .get_index(scope, i)
+                    .ok_or_else(|| "Failed to get property name".to_string())?;
+                let key_str = key
+                    .to_string(scope)
+                    .ok_or_else(|| "Failed to convert key to string".to_string())?
+                    .to_rust_string_lossy(scope);
+
+                let val = obj
+                    .get(scope, key)
+                    .ok_or_else(|| format!("Failed to get property '{}'", key_str))?;
+
+                // If the value is a function, capture the object as the receiver for 'this' binding
+                let receiver_for_val = if val.is_function() {
+                    let obj_as_value: deno_core::v8::Local<deno_core::v8::Value> = obj.into();
+                    Some(deno_core::v8::Global::new(scope, obj_as_value))
+                } else {
+                    None
+                };
+
+                tracker.add_bytes(key_str.len())?;
+                map.insert(
+                    key_str,
+                    Self::value_to_js_value_internal(
+                        fn_registry,
+                        next_fn_id,
+                        scope,
+                        val,
+                        seen,
+                        tracker,
+                        receiver_for_val,
+                    )?,
+                );
+            }
+
+            seen.remove(&hash);
+            Ok(JSValue::Object(map))
+        } else {
+            // Fallback: convert to string
+            let string = value
+                .to_string(scope)
+                .ok_or_else(|| "Failed to convert value to string".to_string())?;
+            let rust_str = string.to_rust_string_lossy(scope);
+            tracker.add_bytes(rust_str.len())?;
+            Ok(JSValue::String(rust_str))
+        };
+
+        tracker.exit();
+        result
     }
 }
 
 fn to_string(error: CoreError) -> String {
     error.to_string()
-}
-
-/// Convert a V8 value to JSValue with circular reference detection and limits enforced
-fn value_to_js_value<'s>(
-    scope: &mut deno_core::v8::HandleScope<'s>,
-    value: deno_core::v8::Local<'s, deno_core::v8::Value>,
-) -> Result<JSValue, String> {
-    let mut seen = HashSet::new();
-    let mut tracker = LimitTracker::new(MAX_JS_DEPTH, MAX_JS_BYTES);
-    value_to_js_value_internal(scope, value, &mut seen, &mut tracker)
-}
-
-/// Internal recursive converter with cycle detection
-fn value_to_js_value_internal<'s>(
-    scope: &mut deno_core::v8::HandleScope<'s>,
-    value: deno_core::v8::Local<'s, deno_core::v8::Value>,
-    seen: &mut HashSet<i32>,
-    tracker: &mut LimitTracker,
-) -> Result<JSValue, String> {
-    tracker.enter()?;
-
-    let result = if value.is_null() || value.is_undefined() {
-        tracker.add_bytes(4)?; // "null" or "undefined"
-        Ok(JSValue::Null)
-    } else if value.is_boolean() {
-        tracker.add_bytes(5)?; // "false" (worst case)
-        Ok(JSValue::Bool(value.boolean_value(scope)))
-    } else if value.is_number() {
-        // Handle special numeric values (NaN, ±Infinity)
-        let num_obj = value
-            .to_number(scope)
-            .ok_or_else(|| "Failed to convert value to number".to_string())?;
-        let num_val = num_obj.value();
-        if num_val.is_nan() || num_val.is_infinite() {
-            tracker.add_bytes(24)?;
-            Ok(JSValue::Float(num_val))
-        } else if num_val.fract() == 0.0 && num_val.is_finite() {
-            let as_int = num_val as i64;
-            if as_int as f64 == num_val {
-                tracker.add_bytes(20)?;
-                Ok(JSValue::Int(as_int))
-            } else {
-                tracker.add_bytes(24)?;
-                Ok(JSValue::Float(num_val))
-            }
-        } else {
-            tracker.add_bytes(24)?;
-            Ok(JSValue::Float(num_val))
-        }
-    } else if value.is_string() {
-        let string = value
-            .to_string(scope)
-            .ok_or_else(|| "Failed to convert string".to_string())?;
-        let rust_str = string.to_rust_string_lossy(scope);
-        tracker.add_bytes(rust_str.len())?;
-        Ok(JSValue::String(rust_str))
-    } else if value.is_big_int() {
-        // Try to convert BigInt to i64, otherwise error
-        let bigint = deno_core::v8::Local::<deno_core::v8::BigInt>::try_from(value)
-            .map_err(|_| "Failed to cast to BigInt".to_string())?;
-        let (val, lossless) = bigint.i64_value();
-        if lossless {
-            tracker.add_bytes(20)?;
-            Ok(JSValue::Int(val))
-        } else {
-            Err("BigInt value too large to represent as i64".to_string())
-        }
-    } else if value.is_function() || value.is_symbol() {
-        Err("Cannot serialize V8 function or symbol".to_string())
-    } else if value.is_array() {
-        // Check for circular reference using identity hash
-        let obj = deno_core::v8::Local::<deno_core::v8::Object>::try_from(value)
-            .map_err(|_| "Failed to cast array to object".to_string())?;
-        let hash = obj.get_identity_hash().get();
-
-        if !seen.insert(hash) {
-            return Err("Cannot serialize circular reference".to_string());
-        }
-
-        let array = deno_core::v8::Local::<deno_core::v8::Array>::try_from(value)
-            .map_err(|_| "Failed to cast to array".to_string())?;
-        let len = array.length() as usize;
-
-        let mut items = Vec::with_capacity(len);
-        for i in 0..len {
-            let idx = i as u32;
-            let item = array
-                .get_index(scope, idx)
-                .ok_or_else(|| format!("Failed to get array index {}", i))?;
-            items.push(value_to_js_value_internal(scope, item, seen, tracker)?);
-        }
-
-        seen.remove(&hash);
-        Ok(JSValue::Array(items))
-    } else if value.is_object() {
-        // Check for circular reference using identity hash
-        let obj = deno_core::v8::Local::<deno_core::v8::Object>::try_from(value)
-            .map_err(|_| "Failed to cast to object".to_string())?;
-        let hash = obj.get_identity_hash().get();
-
-        if !seen.insert(hash) {
-            return Err("Cannot serialize circular reference".to_string());
-        }
-
-        // Get property names
-        let prop_names = obj
-            .get_own_property_names(scope, deno_core::v8::GetPropertyNamesArgs::default())
-            .ok_or_else(|| "Failed to get property names".to_string())?;
-
-        let mut map = IndexMap::new();
-        for i in 0..prop_names.length() {
-            let key = prop_names
-                .get_index(scope, i)
-                .ok_or_else(|| "Failed to get property name".to_string())?;
-            let key_str = key
-                .to_string(scope)
-                .ok_or_else(|| "Failed to convert key to string".to_string())?
-                .to_rust_string_lossy(scope);
-
-            let val = obj
-                .get(scope, key)
-                .ok_or_else(|| format!("Failed to get property '{}'", key_str))?;
-
-            tracker.add_bytes(key_str.len())?;
-            map.insert(
-                key_str,
-                value_to_js_value_internal(scope, val, seen, tracker)?,
-            );
-        }
-
-        seen.remove(&hash);
-        Ok(JSValue::Object(map))
-    } else {
-        // Fallback: convert to string
-        let string = value
-            .to_string(scope)
-            .ok_or_else(|| "Failed to convert value to string".to_string())?;
-        let rust_str = string.to_rust_string_lossy(scope);
-        tracker.add_bytes(rust_str.len())?;
-        Ok(JSValue::String(rust_str))
-    };
-
-    tracker.exit();
-    result
 }

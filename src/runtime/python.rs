@@ -88,6 +88,7 @@ impl Runtime {
         let task_locals = tokio::get_current_locals(py).ok();
 
         // Convert the JSValue result to Python after the async operation completes
+        let handle_for_conversion = handle.clone();
         let future = async move {
             let js_result = handle
                 .eval_async(&code, timeout_ms, task_locals)
@@ -95,7 +96,7 @@ impl Runtime {
                 .map_err(|e| PyRuntimeError::new_err(format!("Evaluation failed: {}", e)))?;
 
             // Convert JSValue to Python in the current Python context
-            Python::attach(|py| js_value_to_python(py, &js_result))
+            Python::attach(|py| js_value_to_python(py, &js_result, Some(&handle_for_conversion)))
         };
 
         pyo3_async_runtimes::tokio::future_into_py(py, future)
@@ -112,7 +113,7 @@ impl Runtime {
         let js_value = py
             .detach(|| handle.eval_sync(&code_owned))
             .map_err(|e| PyRuntimeError::new_err(format!("Evaluation failed: {}", e)))?;
-        js_value_to_python(py, &js_value)
+        js_value_to_python(py, &js_value, Some(&handle))
     }
 
     fn is_closed(&self) -> bool {
@@ -247,7 +248,7 @@ impl Runtime {
         let js_value = py
             .detach(|| handle.eval_module_sync(&specifier_owned))
             .map_err(|e| PyRuntimeError::new_err(format!("Module evaluation failed: {}", e)))?;
-        js_value_to_python(py, &js_value)
+        js_value_to_python(py, &js_value, Some(&handle))
     }
 
     #[pyo3(signature = (specifier, /, *, timeout_ms=None))]
@@ -268,6 +269,7 @@ impl Runtime {
         let task_locals = tokio::get_current_locals(py).ok();
 
         // Convert the JSValue result to Python after the async operation completes
+        let handle_for_conversion = handle.clone();
         let future = async move {
             let js_result = handle
                 .eval_module_async(&specifier, timeout_ms, task_locals)
@@ -275,7 +277,7 @@ impl Runtime {
                 .map_err(|e| PyRuntimeError::new_err(format!("Module evaluation failed: {}", e)))?;
 
             // Convert JSValue to Python in the current Python context
-            Python::attach(|py| js_value_to_python(py, &js_result))
+            Python::attach(|py| js_value_to_python(py, &js_result, Some(&handle_for_conversion)))
         };
 
         pyo3_async_runtimes::tokio::future_into_py(py, future)
@@ -293,5 +295,166 @@ impl Runtime {
     ) -> PyResult<bool> {
         self.close()?;
         Ok(false)
+    }
+}
+
+/// Python proxy for a JavaScript function.
+///
+/// This class represents a JavaScript function that can be called from Python.
+/// Functions are awaitable by default (async-first design).
+#[pyclass(unsendable)]
+pub struct JsFunction {
+    handle: std::cell::RefCell<Option<RuntimeHandle>>,
+    fn_id: u32,
+    closed: std::cell::Cell<bool>,
+}
+
+impl JsFunction {
+    pub fn new(handle: RuntimeHandle, fn_id: u32) -> PyResult<Self> {
+        Ok(Self {
+            handle: std::cell::RefCell::new(Some(handle)),
+            fn_id,
+            closed: std::cell::Cell::new(false),
+        })
+    }
+
+    /// Get the function ID for transfer back to JavaScript.
+    ///
+    /// Validates that the function is not closed and the runtime is still alive.
+    /// This prevents cryptic "Function ID not found" errors from the runtime thread.
+    pub(crate) fn function_id_for_transfer(&self) -> PyResult<u32> {
+        // Check if function has been closed
+        if self.closed.get() {
+            return Err(PyRuntimeError::new_err("Function has been closed"));
+        }
+
+        // Check if runtime handle is still alive
+        let handle = self.handle.borrow();
+        if handle.is_none() {
+            return Err(PyRuntimeError::new_err("Runtime has been shut down"));
+        }
+
+        // Additional check: verify runtime is not shutdown
+        if let Some(h) = handle.as_ref() {
+            if h.is_shutdown() {
+                return Err(PyRuntimeError::new_err("Runtime has been shut down"));
+            }
+        }
+
+        Ok(self.fn_id)
+    }
+}
+
+#[pymethods]
+impl JsFunction {
+    /// Call the JavaScript function with the given arguments.
+    ///
+    /// Returns an awaitable that resolves to the function result.
+    ///
+    /// Args:
+    ///     *args: Arguments to pass to the JavaScript function
+    ///     timeout_ms: Optional timeout in milliseconds
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to the function's return value
+    #[pyo3(signature = (*args, timeout_ms=None))]
+    fn __call__<'py>(
+        &self,
+        py: Python<'py>,
+        args: &Bound<'py, pyo3::types::PyTuple>,
+        timeout_ms: Option<u64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        // Check if closed
+        if self.closed.get() {
+            return Err(PyRuntimeError::new_err("Function has been closed"));
+        }
+
+        // Get handle
+        let handle = self
+            .handle
+            .borrow()
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Runtime has been shut down"))?
+            .clone();
+
+        let fn_id = self.fn_id;
+
+        // Convert Python args to Vec<JSValue>
+        use super::conversion::python_to_js_value;
+        let mut js_args = Vec::with_capacity(args.len());
+        for arg in args.iter() {
+            js_args.push(python_to_js_value(arg)?);
+        }
+
+        // Capture task_locals
+        let task_locals = tokio::get_current_locals(py).ok();
+
+        // Call the function asynchronously
+        let handle_for_conversion = handle.clone();
+        let future = async move {
+            let js_result = handle
+                .call_function_async(fn_id, js_args, timeout_ms, task_locals)
+                .await
+                .map_err(|e| PyRuntimeError::new_err(format!("Function call failed: {}", e)))?;
+
+            // Convert JSValue result to Python
+            Python::attach(|py| js_value_to_python(py, &js_result, Some(&handle_for_conversion)))
+        };
+
+        pyo3_async_runtimes::tokio::future_into_py(py, future)
+    }
+
+    /// Close the function handle and release resources.
+    ///
+    /// After calling close(), the function can no longer be invoked.
+    fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        if self.closed.get() {
+            // Already closed, return immediately
+            return pyo3_async_runtimes::tokio::future_into_py(py, async { Ok(()) });
+        }
+
+        let handle = self
+            .handle
+            .borrow()
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Runtime has been shut down"))?
+            .clone();
+
+        let fn_id = self.fn_id;
+        self.closed.set(true);
+
+        let future = async move {
+            handle
+                .release_function_async(fn_id)
+                .await
+                .map_err(|e| PyRuntimeError::new_err(format!("Failed to release function: {}", e)))
+        };
+
+        pyo3_async_runtimes::tokio::future_into_py(py, future)
+    }
+
+    /// String representation of the function.
+    fn __repr__(&self) -> String {
+        if self.closed.get() {
+            "<JsFunction (closed)>".to_string()
+        } else {
+            format!("<JsFunction id={}>", self.fn_id)
+        }
+    }
+
+    /// Destructor that warns if the function wasn't closed.
+    fn __del__(&self) {
+        if !self.closed.get() {
+            // Note: Can't do async cleanup in __del__, user must call close()
+            Python::attach(|py| {
+                if let Ok(warnings) = py.import("warnings") {
+                    let message = format!(
+                        "JsFunction id={} not closed before drop. Call .close() explicitly.",
+                        self.fn_id
+                    );
+                    let _ = warnings.call_method1("warn", (message, "ResourceWarning"));
+                }
+            });
+        }
     }
 }

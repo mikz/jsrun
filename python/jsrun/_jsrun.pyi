@@ -3,16 +3,12 @@ Type stubs for the jsrun Python extension module.
 """
 
 import types
-from typing import (
-    Any,
-    Callable,
-    Optional,
-    Self,
-)
+from typing import Any, Awaitable, Callable, Optional, Self
 
 __all__ = [
     "Runtime",
     "RuntimeConfig",
+    "JsFunction",
 ]
 
 # Core runtime types
@@ -85,6 +81,36 @@ class RuntimeConfig:
 
         Args:
             timeout: Timeout in seconds (float or int)
+        """
+        ...
+
+    def __repr__(self) -> str: ...
+
+class JsFunction:
+    """
+    Proxy for a JavaScript function returned from the runtime.
+
+    Instances are awaitable callables that execute on the underlying V8 isolate.
+    """
+
+    def __call__(self, *args: Any, timeout_ms: Optional[int] = ...) -> Awaitable[Any]:
+        """
+        Invoke the JavaScript function with the provided arguments.
+
+        Args:
+            *args: Arguments forwarded into JavaScript
+            timeout_ms: Optional timeout for this call in milliseconds
+
+        Returns:
+            An awaitable that resolves to the JavaScript return value.
+        """
+        ...
+
+    def close(self) -> Awaitable[None]:
+        """
+        Release the function handle.
+
+        After closing, the proxy can no longer be awaited.
         """
         ...
 

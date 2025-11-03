@@ -17,10 +17,9 @@ pub const MAX_JS_BYTES: usize = 10 * 1024 * 1024; // 10MB
 /// Unlike `serde_json::Value`, this enum can represent special numeric values
 /// (NaN, ±Infinity) and enforces proper depth/size limits during conversion.
 ///
-/// Note: The Serialize/Deserialize implementations work directly with serde_v8
-/// to preserve special float values.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
+/// Note: The Serialize/Deserialize implementations are manually implemented
+/// because the Function variant cannot be serialized.
+#[derive(Clone, Debug, PartialEq)]
 pub enum JSValue {
     /// JavaScript null
     Null,
@@ -36,9 +35,115 @@ pub enum JSValue {
     Array(Vec<JSValue>),
     /// JavaScript object (uses IndexMap to preserve insertion order)
     Object(IndexMap<String, JSValue>),
+    /// JavaScript function (proxy via registry ID)
+    Function { id: u32 },
 }
 
 impl JSValue {}
+
+// Manual Serialize implementation that errors on Function variant
+impl Serialize for JSValue {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::Error;
+        match self {
+            JSValue::Null => serializer.serialize_none(),
+            JSValue::Bool(b) => serializer.serialize_bool(*b),
+            JSValue::Int(i) => serializer.serialize_i64(*i),
+            JSValue::Float(f) => serializer.serialize_f64(*f),
+            JSValue::String(s) => serializer.serialize_str(s),
+            JSValue::Array(arr) => arr.serialize(serializer),
+            JSValue::Object(obj) => obj.serialize(serializer),
+            JSValue::Function { id } => Err(Error::custom(format!(
+                "Cannot serialize JSValue::Function (id: {}). Functions must be called, not serialized.",
+                id
+            ))),
+        }
+    }
+}
+
+// Manual Deserialize implementation that rejects Function variant
+impl<'de> Deserialize<'de> for JSValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{self, Visitor};
+
+        struct JSValueVisitor;
+
+        impl<'de> Visitor<'de> for JSValueVisitor {
+            type Value = JSValue;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter
+                    .write_str("a JavaScript value (null, bool, number, string, array, or object)")
+            }
+
+            fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+                Ok(JSValue::Bool(value))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+                Ok(JSValue::Int(value))
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+                if value <= i64::MAX as u64 {
+                    Ok(JSValue::Int(value as i64))
+                } else {
+                    Ok(JSValue::Float(value as f64))
+                }
+            }
+
+            fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E> {
+                Ok(JSValue::Float(value))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(JSValue::String(value.to_owned()))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+                Ok(JSValue::String(value))
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(JSValue::Null)
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(JSValue::Null)
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: de::SeqAccess<'de>,
+            {
+                let mut vec = Vec::new();
+                while let Some(elem) = seq.next_element()? {
+                    vec.push(elem);
+                }
+                Ok(JSValue::Array(vec))
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: de::MapAccess<'de>,
+            {
+                let mut obj = IndexMap::new();
+                while let Some((key, value)) = map.next_entry()? {
+                    obj.insert(key, value);
+                }
+                Ok(JSValue::Object(obj))
+            }
+        }
+
+        deserializer.deserialize_any(JSValueVisitor)
+    }
+}
 
 /// Tracks depth and size limits during JavaScript value conversion.
 ///

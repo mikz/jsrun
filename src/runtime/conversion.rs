@@ -11,7 +11,13 @@ use std::collections::HashSet;
 ///
 /// This is the new primary conversion function that supports native JavaScript values
 /// including NaN and ±Infinity without sentinel strings.
-pub(crate) fn js_value_to_python(py: Python<'_>, value: &JSValue) -> PyResult<Py<PyAny>> {
+///
+/// For Function variants, a RuntimeHandle must be provided to create JsFunction proxies.
+pub(crate) fn js_value_to_python(
+    py: Python<'_>,
+    value: &JSValue,
+    handle: Option<&super::handle::RuntimeHandle>,
+) -> PyResult<Py<PyAny>> {
     match value {
         JSValue::Null => Ok(py.None()),
         JSValue::Bool(b) => Ok(PyBool::new(py, *b).to_owned().into_any().unbind()),
@@ -21,16 +27,26 @@ pub(crate) fn js_value_to_python(py: Python<'_>, value: &JSValue) -> PyResult<Py
         JSValue::Array(items) => {
             let list = PyList::empty(py);
             for item in items {
-                list.append(js_value_to_python(py, item)?)?;
+                list.append(js_value_to_python(py, item, handle)?)?;
             }
             Ok(list.into())
         }
         JSValue::Object(map) => {
             let dict = PyDict::new(py);
             for (key, val) in map {
-                dict.set_item(key, js_value_to_python(py, val)?)?;
+                dict.set_item(key, js_value_to_python(py, val, handle)?)?;
             }
             Ok(dict.into())
+        }
+        JSValue::Function { id } => {
+            // Create JsFunction proxy
+            let handle = handle.ok_or_else(|| {
+                PyRuntimeError::new_err("RuntimeHandle required to convert JSValue::Function")
+            })?;
+
+            let js_fn = super::python::JsFunction::new(handle.clone(), *id)?;
+            let py_obj: Py<PyAny> = Py::new(py, js_fn)?.into();
+            Ok(py_obj)
         }
     }
 }
@@ -132,6 +148,12 @@ fn python_to_js_value_internal(
         add_bytes(s.len(), tracker)?;
         add_bytes(16, tracker)?;
         Ok(JSValue::String(s))
+    } else if let Ok(js_fn) = obj.extract::<pyo3::PyRef<super::python::JsFunction>>() {
+        // JsFunction proxy - extract the function ID for round-trip
+        // This validates that the function is not closed and runtime is alive
+        let id = js_fn.function_id_for_transfer()?;
+        add_bytes(8, tracker)?;
+        Ok(JSValue::Function { id })
     } else {
         Err(PyRuntimeError::new_err(
             "Unsupported Python type for JSValue conversion",

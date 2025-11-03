@@ -124,7 +124,7 @@ fn op_jsrun_call_python_sync(
     Python::attach(|py| -> Result<JSValue, JsErrorBox> {
         let py_args = args
             .iter()
-            .map(|arg| js_value_to_python(py, arg).map_err(map_pyerr))
+            .map(|arg| js_value_to_python(py, arg, None).map_err(map_pyerr))
             .collect::<Result<Vec<_>, _>>()?;
         let py_args_tuple = PyTuple::new(py, py_args).map_err(map_pyerr)?;
         let result = entry
@@ -159,7 +159,7 @@ fn op_jsrun_call_python_async(
     let concurrent_future = Python::attach(|py| -> Result<Py<PyAny>, JsErrorBox> {
         let py_args = args
             .iter()
-            .map(|arg| js_value_to_python(py, arg).map_err(map_pyerr))
+            .map(|arg| js_value_to_python(py, arg, None).map_err(map_pyerr))
             .collect::<Result<Vec<_>, _>>()?;
         let py_args_tuple = PyTuple::new(py, py_args).map_err(map_pyerr)?;
         let awaitable = entry
