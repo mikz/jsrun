@@ -24,6 +24,15 @@ class TestRuntimeBasics:
         assert not runtime.is_closed()
         runtime.close()
 
+    def test_sanitized_globals(self):
+        """Test that internal globals are sanitized from the runtime."""
+        runtime = Runtime()
+        try:
+            result = runtime.eval("typeof Deno")
+            assert result == "undefined"
+        finally:
+            runtime.close()
+
     def test_runtime_eval_simple(self):
         """Test basic JavaScript evaluation."""
         runtime = Runtime()

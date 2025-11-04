@@ -214,6 +214,10 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
     let bridge_code = ascii_str!(
         r#"(function (globalThis) {
   const { ops } = Deno.core;
+
+  // Delete Deno global after caching ops
+  delete globalThis.Deno;
+
   function prepare(value) {
     if (value === undefined || value === null) {
       return value;
