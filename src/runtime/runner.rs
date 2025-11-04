@@ -11,11 +11,13 @@ use crate::runtime::ops::{python_extension, PythonOpMode, PythonOpRegistry};
 use deno_core::error::CoreError;
 use deno_core::{v8, JsRuntime, PollEventLoopOptions, RuntimeOptions};
 use indexmap::IndexMap;
+use num_bigint::{BigInt, Sign};
 use pyo3::prelude::Py;
 use pyo3::PyAny;
 use pyo3_async_runtimes::TaskLocals;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::ptr;
 use std::rc::Rc;
 use std::sync::mpsc::Receiver as StdReceiver;
 use std::sync::mpsc::Sender as StdSender;
@@ -525,44 +527,34 @@ impl RuntimeCore {
 
         // Look up function in registry and call it
         let result_global = {
-            let registry = self.fn_registry.borrow();
-            let stored = registry
-                .get(&fn_id)
-                .ok_or_else(|| format!("Function ID {} not found", fn_id))?;
-
-            // Create scope and get function + receiver
             let scope = &mut self.js_runtime.handle_scope();
-            let func = deno_core::v8::Local::new(scope, &stored.function);
-            let receiver = stored
-                .receiver
-                .as_ref()
-                .map(|r| deno_core::v8::Local::new(scope, r))
-                .unwrap_or_else(|| scope.get_current_context().global(scope).into());
+
+            let (func, receiver) = {
+                let registry = self.fn_registry.borrow();
+                let stored = registry
+                    .get(&fn_id)
+                    .ok_or_else(|| format!("Function ID {} not found", fn_id))?;
+                let func = deno_core::v8::Local::new(scope, &stored.function);
+                let receiver = stored
+                    .receiver
+                    .as_ref()
+                    .map(|r| deno_core::v8::Local::new(scope, r));
+                (func, receiver)
+            };
 
             // Convert arguments from JSValue to v8::Value
             let mut v8_args = Vec::with_capacity(args.len());
-            for arg in args {
-                let v8_val = match arg {
-                    JSValue::Function { id } => {
-                        // Look up the function in the registry and convert to v8::Function
-                        let stored = registry
-                            .get(&id)
-                            .ok_or_else(|| format!("Function ID {} not found in args", id))?;
-                        deno_core::v8::Local::new(scope, &stored.function).into()
-                    }
-                    _ => {
-                        // Use serde_v8 for other types
-                        deno_core::serde_v8::to_v8(scope, arg)
-                            .map_err(|e| format!("Failed to convert argument: {}", e))?
-                    }
-                };
+            for arg in &args {
+                let v8_val = Self::js_value_to_v8(&self.fn_registry, scope, arg)?;
                 v8_args.push(v8_val);
             }
-            drop(registry); // Release borrow before function call
+
+            let call_receiver =
+                receiver.unwrap_or_else(|| scope.get_current_context().global(scope).into());
 
             // Call the function
             let result = func
-                .call(scope, receiver, &v8_args)
+                .call(scope, call_receiver, &v8_args)
                 .ok_or_else(|| "Function call failed".to_string())?;
 
             // Convert to Global for async resolution
@@ -625,6 +617,89 @@ impl RuntimeCore {
         )
     }
 
+    fn js_value_to_v8<'s>(
+        registry: &Rc<RefCell<HashMap<u32, StoredFunction>>>,
+        scope: &mut v8::HandleScope<'s>,
+        value: &JSValue,
+    ) -> Result<v8::Local<'s, v8::Value>, String> {
+        match value {
+            JSValue::Undefined => Ok(v8::undefined(scope).into()),
+            JSValue::Null => Ok(v8::null(scope).into()),
+            JSValue::Bool(b) => Ok(v8::Boolean::new(scope, *b).into()),
+            JSValue::Int(i) => Ok(v8::Number::new(scope, *i as f64).into()),
+            JSValue::BigInt(bigint) => {
+                let (sign, bytes) = bigint.to_bytes_le();
+                let mut words = Vec::with_capacity(bytes.len().div_ceil(8));
+                for chunk in bytes.chunks(8) {
+                    let mut buf = [0u8; 8];
+                    buf[..chunk.len()].copy_from_slice(chunk);
+                    words.push(u64::from_le_bytes(buf));
+                }
+                let sign_bit = matches!(sign, Sign::Minus);
+                let v8_bigint = v8::BigInt::new_from_words(scope, sign_bit, &words)
+                    .ok_or_else(|| "Failed to create BigInt".to_string())?;
+                Ok(v8_bigint.into())
+            }
+            JSValue::Float(f) => Ok(v8::Number::new(scope, *f).into()),
+            JSValue::String(s) => {
+                let v8_str = v8::String::new(scope, s)
+                    .ok_or_else(|| "Failed to allocate string".to_string())?;
+                Ok(v8_str.into())
+            }
+            JSValue::Bytes(bytes) => {
+                let backing = v8::ArrayBuffer::new_backing_store_from_vec(bytes.clone());
+                let shared = backing.make_shared();
+                let buffer = v8::ArrayBuffer::with_backing_store(scope, &shared);
+                let len = bytes.len();
+                let typed = v8::Uint8Array::new(scope, buffer, 0, len)
+                    .ok_or_else(|| "Failed to create Uint8Array".to_string())?;
+                Ok(typed.into())
+            }
+            JSValue::Array(items) => {
+                let array = v8::Array::new(scope, items.len() as i32);
+                for (index, item) in items.iter().enumerate() {
+                    let v8_value = Self::js_value_to_v8(registry, scope, item)?;
+                    array
+                        .set_index(scope, index as u32, v8_value)
+                        .ok_or_else(|| "Failed to set array element".to_string())?;
+                }
+                Ok(array.into())
+            }
+            JSValue::Set(values) => {
+                let set = v8::Set::new(scope);
+                for value in values {
+                    let v8_value = Self::js_value_to_v8(registry, scope, value)?;
+                    set.add(scope, v8_value);
+                }
+                Ok(set.into())
+            }
+            JSValue::Object(map) => {
+                let object = v8::Object::new(scope);
+                for (key, val) in map.iter() {
+                    let key_str = v8::String::new(scope, key)
+                        .ok_or_else(|| format!("Failed to allocate key '{key}'"))?;
+                    let v8_value = Self::js_value_to_v8(registry, scope, val)?;
+                    object
+                        .set(scope, key_str.into(), v8_value)
+                        .ok_or_else(|| format!("Failed to set property '{key}'"))?;
+                }
+                Ok(object.into())
+            }
+            JSValue::Date(epoch_ms) => {
+                let date = v8::Date::new(scope, *epoch_ms as f64)
+                    .ok_or_else(|| "Failed to create Date".to_string())?;
+                Ok(date.into())
+            }
+            JSValue::Function { id } => {
+                let registry_ref = registry.borrow();
+                let stored = registry_ref
+                    .get(id)
+                    .ok_or_else(|| format!("Function ID {} not found in args", id))?;
+                Ok(v8::Local::new(scope, &stored.function).into())
+            }
+        }
+    }
+
     /// Internal recursive converter with cycle detection and optional receiver capture.
     fn value_to_js_value_internal<'s>(
         fn_registry: &Rc<RefCell<HashMap<u32, StoredFunction>>>,
@@ -637,8 +712,11 @@ impl RuntimeCore {
     ) -> Result<JSValue, String> {
         tracker.enter()?;
 
-        let result = if value.is_null() || value.is_undefined() {
-            tracker.add_bytes(4)?; // "null" or "undefined"
+        let result = if value.is_undefined() {
+            tracker.add_bytes(0)?;
+            Ok(JSValue::Undefined)
+        } else if value.is_null() {
+            tracker.add_bytes(4)?;
             Ok(JSValue::Null)
         } else if value.is_boolean() {
             tracker.add_bytes(5)?; // "false" (worst case)
@@ -665,6 +743,23 @@ impl RuntimeCore {
                 tracker.add_bytes(24)?;
                 Ok(JSValue::Float(num_val))
             }
+        } else if value.is_big_int() {
+            let bigint = deno_core::v8::Local::<deno_core::v8::BigInt>::try_from(value)
+                .map_err(|_| "Failed to cast to BigInt".to_string())?;
+            let (int_value, lossless) = bigint.i64_value();
+            if lossless {
+                tracker.add_bytes(20)?;
+                Ok(JSValue::Int(int_value))
+            } else {
+                let string = bigint
+                    .to_string(scope)
+                    .ok_or_else(|| "Failed to stringify BigInt".to_string())?
+                    .to_rust_string_lossy(scope);
+                let parsed = BigInt::parse_bytes(string.as_bytes(), 10)
+                    .ok_or_else(|| "Failed to parse BigInt literal".to_string())?;
+                tracker.add_bytes(string.len())?;
+                Ok(JSValue::BigInt(parsed))
+            }
         } else if value.is_string() {
             let string = value
                 .to_string(scope)
@@ -672,17 +767,6 @@ impl RuntimeCore {
             let rust_str = string.to_rust_string_lossy(scope);
             tracker.add_bytes(rust_str.len())?;
             Ok(JSValue::String(rust_str))
-        } else if value.is_big_int() {
-            // Try to convert BigInt to i64, otherwise error
-            let bigint = deno_core::v8::Local::<deno_core::v8::BigInt>::try_from(value)
-                .map_err(|_| "Failed to cast to BigInt".to_string())?;
-            let (val, lossless) = bigint.i64_value();
-            if lossless {
-                tracker.add_bytes(20)?;
-                Ok(JSValue::Int(val))
-            } else {
-                Err("BigInt value too large to represent as i64".to_string())
-            }
         } else if value.is_function() {
             // Register function and return proxy ID
             let func = deno_core::v8::Local::<deno_core::v8::Function>::try_from(value)
@@ -710,6 +794,33 @@ impl RuntimeCore {
             Ok(JSValue::Function { id: fn_id })
         } else if value.is_symbol() {
             Err("Cannot serialize V8 symbol".to_string())
+        } else if value.is_uint8_array() {
+            let typed_array = deno_core::v8::Local::<deno_core::v8::Uint8Array>::try_from(value)
+                .map_err(|_| "Failed to cast to Uint8Array".to_string())?;
+            let length = typed_array.byte_length();
+            tracker.add_bytes(length)?;
+            let mut buffer = vec![0u8; length];
+            let view: deno_core::v8::Local<deno_core::v8::ArrayBufferView> = typed_array.into();
+            view.copy_contents(&mut buffer);
+            Ok(JSValue::Bytes(buffer))
+        } else if value.is_array_buffer() {
+            let array_buffer = deno_core::v8::Local::<deno_core::v8::ArrayBuffer>::try_from(value)
+                .map_err(|_| "Failed to cast to ArrayBuffer".to_string())?;
+            let length = array_buffer.byte_length();
+            tracker.add_bytes(length)?;
+            let mut buffer = vec![0u8; length];
+            if length > 0 {
+                if let Some(data_ptr) = array_buffer.data() {
+                    unsafe {
+                        ptr::copy_nonoverlapping(
+                            data_ptr.as_ptr() as *const u8,
+                            buffer.as_mut_ptr(),
+                            length,
+                        );
+                    }
+                }
+            }
+            Ok(JSValue::Bytes(buffer))
         } else if value.is_array() {
             // Check for circular reference using identity hash
             let obj = deno_core::v8::Local::<deno_core::v8::Object>::try_from(value)
@@ -743,6 +854,50 @@ impl RuntimeCore {
 
             seen.remove(&hash);
             Ok(JSValue::Array(items))
+        } else if value.is_set() {
+            let obj = deno_core::v8::Local::<deno_core::v8::Object>::try_from(value)
+                .map_err(|_| "Failed to cast set to object".to_string())?;
+            let hash = obj.get_identity_hash().get();
+
+            if !seen.insert(hash) {
+                return Err("Cannot serialize circular reference".to_string());
+            }
+
+            let set = deno_core::v8::Local::<deno_core::v8::Set>::try_from(value)
+                .map_err(|_| "Failed to cast to Set".to_string())?;
+            let entries = set.as_array(scope);
+            let len = entries.length() as usize;
+
+            tracker.add_bytes(24)?;
+            tracker.add_bytes(len.saturating_mul(std::mem::size_of::<usize>()))?;
+
+            let mut values = Vec::with_capacity(len);
+            for index in 0..len {
+                let element = entries
+                    .get_index(scope, index as u32)
+                    .ok_or_else(|| "Failed to get Set entry".to_string())?;
+                values.push(Self::value_to_js_value_internal(
+                    fn_registry,
+                    next_fn_id,
+                    scope,
+                    element,
+                    seen,
+                    tracker,
+                    None,
+                )?);
+            }
+
+            seen.remove(&hash);
+            Ok(JSValue::Set(values))
+        } else if value.is_date() {
+            let date = deno_core::v8::Local::<deno_core::v8::Date>::try_from(value)
+                .map_err(|_| "Failed to cast to Date".to_string())?;
+            let epoch_ms = date.value_of();
+            if !epoch_ms.is_finite() || epoch_ms < i64::MIN as f64 || epoch_ms > i64::MAX as f64 {
+                return Err("Date value out of range".to_string());
+            }
+            tracker.add_bytes(16)?;
+            Ok(JSValue::Date(epoch_ms.round() as i64))
         } else if value.is_object() {
             // Check for circular reference using identity hash
             let obj = deno_core::v8::Local::<deno_core::v8::Object>::try_from(value)

@@ -7,8 +7,10 @@ demonstrating how Python-side guards can enforce policy with the revamped API.
 
 import asyncio
 import json
+from datetime import datetime, timezone
+
 import pytest
-from jsrun import Runtime
+from jsrun import JsUndefined, Runtime, undefined
 
 
 class TestOpRegistration:
@@ -273,6 +275,159 @@ class TestOpHandlers:
             payload = json.loads(result)
             assert payload["count"] == 3
             assert payload["data"] == [1, 2, 3]
+
+
+class TestOpValueConversions:
+    """Ensure host ops round-trip richer value types."""
+
+    def test_sync_op_receives_uint8array(self):
+        runtime = Runtime()
+        try:
+            captured = []
+
+            def capture(value):
+                captured.append(value)
+                return None
+
+            op_id = runtime.register_op("captureBytes", capture, mode="sync")
+            runtime.eval(f"__host_op_sync__({op_id}, new Uint8Array([1, 2, 3]))")
+            assert isinstance(captured[0], bytes)
+            assert captured[0] == b"\x01\x02\x03"
+        finally:
+            runtime.close()
+
+    def test_sync_op_returns_bytes(self):
+        runtime = Runtime()
+        try:
+
+            def payload():
+                return b"\xaa\xbb"
+
+            op_id = runtime.register_op("bytesOut", payload, mode="sync")
+            result = runtime.eval(f"__host_op_sync__({op_id})")
+            assert isinstance(result, bytes)
+            assert result == b"\xaa\xbb"
+        finally:
+            runtime.close()
+
+    def test_sync_op_receives_date(self):
+        runtime = Runtime()
+        try:
+            captured = []
+
+            def capture(value):
+                captured.append(value)
+                return None
+
+            op_id = runtime.register_op("captureDate", capture, mode="sync")
+            runtime.eval(f"__host_op_sync__({op_id}, new Date(1704067200000))")
+            expected = datetime.fromtimestamp(1704067200, tz=timezone.utc)
+            assert isinstance(captured[0], datetime)
+            assert captured[0] == expected
+        finally:
+            runtime.close()
+
+    def test_sync_op_returns_datetime(self):
+        runtime = Runtime()
+        try:
+
+            def emit():
+                return datetime(2023, 12, 25, 0, 0, tzinfo=timezone.utc)
+
+            op_id = runtime.register_op("dateOut", emit, mode="sync")
+            result = runtime.eval(f"__host_op_sync__({op_id})")
+            assert isinstance(result, datetime)
+            assert result == datetime(2023, 12, 25, 0, 0, tzinfo=timezone.utc)
+        finally:
+            runtime.close()
+
+    def test_sync_op_receives_set(self):
+        runtime = Runtime()
+        try:
+            captured = []
+
+            def capture(value):
+                captured.append(value)
+                return None
+
+            op_id = runtime.register_op("captureSet", capture, mode="sync")
+            runtime.eval(f"__host_op_sync__({op_id}, new Set([1, 2, 3]))")
+            assert isinstance(captured[0], set)
+            assert captured[0] == {1, 2, 3}
+        finally:
+            runtime.close()
+
+    def test_sync_op_returns_set(self):
+        runtime = Runtime()
+        try:
+
+            def emit():
+                return {1, 2, 3}
+
+            op_id = runtime.register_op("setOut", emit, mode="sync")
+            result = runtime.eval(f"Array.from(__host_op_sync__({op_id}))")
+            assert isinstance(result, list)
+            assert set(result) == {1, 2, 3}
+        finally:
+            runtime.close()
+
+    def test_sync_op_receives_bigint(self):
+        runtime = Runtime()
+        try:
+            captured = []
+
+            def capture(value):
+                captured.append(value)
+                return None
+
+            op_id = runtime.register_op("captureBigInt", capture, mode="sync")
+            runtime.eval(f"__host_op_sync__({op_id}, 2n ** 64n)")
+            assert isinstance(captured[0], int)
+            assert captured[0] == 2**64
+        finally:
+            runtime.close()
+
+    def test_sync_op_returns_bigint(self):
+        runtime = Runtime()
+        try:
+
+            def emit():
+                return 2**200
+
+            op_id = runtime.register_op("bigIntOut", emit, mode="sync")
+            result = runtime.eval(f"typeof __host_op_sync__({op_id})")
+            assert result == "bigint"
+        finally:
+            runtime.close()
+
+    def test_sync_op_receives_undefined(self):
+        runtime = Runtime()
+        try:
+            captured = []
+
+            def capture(value):
+                captured.append(value)
+                return None
+
+            op_id = runtime.register_op("captureUndefined", capture, mode="sync")
+            runtime.eval(f"__host_op_sync__({op_id}, undefined)")
+            assert isinstance(captured[0], JsUndefined)
+            assert captured[0] is undefined
+        finally:
+            runtime.close()
+
+    def test_sync_op_returns_undefined(self):
+        runtime = Runtime()
+        try:
+
+            def emit():
+                return undefined
+
+            op_id = runtime.register_op("undefinedOut", emit, mode="sync")
+            result = runtime.eval(f"__host_op_sync__({op_id}) === undefined")
+            assert result is True
+        finally:
+            runtime.close()
 
 
 class TestBindFunction:

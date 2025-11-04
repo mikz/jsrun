@@ -5,12 +5,24 @@
 //! circular references and enforce depth/size limits.
 
 use indexmap::IndexMap;
+use num_bigint::BigInt;
+use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
+use serde_bytes::Bytes;
 
 /// Maximum depth for JavaScript value serialization
 pub const MAX_JS_DEPTH: usize = 100;
 /// Maximum size in bytes for JavaScript value serialization
 pub const MAX_JS_BYTES: usize = 10 * 1024 * 1024; // 10MB
+
+const TYPE_TAG: &str = "__jsrun_type";
+const UNDEFINED_TYPE: &str = "Undefined";
+const DATE_TYPE: &str = "Date";
+const DATE_EPOCH_KEY: &str = "epoch_ms";
+const SET_TYPE: &str = "Set";
+const SET_VALUES_KEY: &str = "values";
+const BIGINT_TYPE: &str = "BigInt";
+const BIGINT_VALUE_KEY: &str = "value";
 
 /// Internal representation of JavaScript values that can round-trip accurately.
 ///
@@ -21,20 +33,30 @@ pub const MAX_JS_BYTES: usize = 10 * 1024 * 1024; // 10MB
 /// because the Function variant cannot be serialized.
 #[derive(Clone, Debug, PartialEq)]
 pub enum JSValue {
+    /// JavaScript undefined
+    Undefined,
     /// JavaScript null
     Null,
     /// JavaScript boolean
     Bool(bool),
     /// JavaScript integer (within i64 range)
     Int(i64),
+    /// JavaScript BigInt
+    BigInt(BigInt),
     /// JavaScript float (including NaN and ±Infinity)
     Float(f64),
     /// JavaScript string
     String(String),
+    /// JavaScript bytes (Uint8Array / ArrayBuffer)
+    Bytes(Vec<u8>),
     /// JavaScript array (preserves order)
     Array(Vec<JSValue>),
     /// JavaScript object (uses IndexMap to preserve insertion order)
     Object(IndexMap<String, JSValue>),
+    /// JavaScript Date (epoch milliseconds, UTC)
+    Date(i64),
+    /// JavaScript Set (preserves insertion order captured from JS)
+    Set(Vec<JSValue>),
     /// JavaScript function (proxy via registry ID)
     Function { id: u32 },
 }
@@ -49,13 +71,37 @@ impl Serialize for JSValue {
     {
         use serde::ser::Error;
         match self {
+            JSValue::Undefined => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry(TYPE_TAG, UNDEFINED_TYPE)?;
+                map.end()
+            }
             JSValue::Null => serializer.serialize_none(),
             JSValue::Bool(b) => serializer.serialize_bool(*b),
             JSValue::Int(i) => serializer.serialize_i64(*i),
+            JSValue::BigInt(bigint) => {
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry(TYPE_TAG, BIGINT_TYPE)?;
+                map.serialize_entry(BIGINT_VALUE_KEY, &bigint.to_str_radix(10))?;
+                map.end()
+            }
             JSValue::Float(f) => serializer.serialize_f64(*f),
             JSValue::String(s) => serializer.serialize_str(s),
+            JSValue::Bytes(bytes) => Bytes::new(bytes).serialize(serializer),
             JSValue::Array(arr) => arr.serialize(serializer),
             JSValue::Object(obj) => obj.serialize(serializer),
+            JSValue::Date(epoch_ms) => {
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry(TYPE_TAG, DATE_TYPE)?;
+                map.serialize_entry(DATE_EPOCH_KEY, epoch_ms)?;
+                map.end()
+            }
+            JSValue::Set(values) => {
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry(TYPE_TAG, SET_TYPE)?;
+                map.serialize_entry(SET_VALUES_KEY, values)?;
+                map.end()
+            }
             JSValue::Function { id } => Err(Error::custom(format!(
                 "Cannot serialize JSValue::Function (id: {}). Functions must be called, not serialized.",
                 id
@@ -70,11 +116,11 @@ impl<'de> Deserialize<'de> for JSValue {
     where
         D: serde::Deserializer<'de>,
     {
-        use serde::de::{self, Visitor};
+        use serde::de;
 
         struct JSValueVisitor;
 
-        impl<'de> Visitor<'de> for JSValueVisitor {
+        impl<'de> serde::de::Visitor<'de> for JSValueVisitor {
             type Value = JSValue;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -115,7 +161,15 @@ impl<'de> Deserialize<'de> for JSValue {
             }
 
             fn visit_unit<E>(self) -> Result<Self::Value, E> {
-                Ok(JSValue::Null)
+                Ok(JSValue::Undefined)
+            }
+
+            fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E> {
+                Ok(JSValue::Bytes(value.to_vec()))
+            }
+
+            fn visit_byte_buf<E>(self, value: Vec<u8>) -> Result<Self::Value, E> {
+                Ok(JSValue::Bytes(value))
             }
 
             fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
@@ -133,11 +187,76 @@ impl<'de> Deserialize<'de> for JSValue {
             where
                 A: de::MapAccess<'de>,
             {
-                let mut obj = IndexMap::new();
-                while let Some((key, value)) = map.next_entry()? {
-                    obj.insert(key, value);
+                let mut object = IndexMap::new();
+                let mut tag: Option<String> = None;
+
+                while let Some((key, value)) = map.next_entry::<String, JSValue>()? {
+                    if key == TYPE_TAG {
+                        if let JSValue::String(tag_value) = value {
+                            tag = Some(tag_value);
+                        } else {
+                            object.insert(key, value);
+                        }
+                    } else {
+                        object.insert(key, value);
+                    }
                 }
-                Ok(JSValue::Object(obj))
+
+                if let Some(tag_value) = tag.clone() {
+                    match tag_value.as_str() {
+                        UNDEFINED_TYPE => {
+                            return Ok(JSValue::Undefined);
+                        }
+                        DATE_TYPE => {
+                            if let Some(epoch_value) = object.get(DATE_EPOCH_KEY) {
+                                if let JSValue::Int(epoch_ms) = epoch_value {
+                                    return Ok(JSValue::Date(*epoch_ms));
+                                } else if let JSValue::Float(epoch_float) = epoch_value {
+                                    if epoch_float.is_finite() {
+                                        return Ok(JSValue::Date(*epoch_float as i64));
+                                    }
+                                }
+                            }
+                        }
+                        SET_TYPE => {
+                            if let Some(JSValue::Array(values)) = object.get(SET_VALUES_KEY) {
+                                return Ok(JSValue::Set(values.clone()));
+                            }
+                        }
+                        BIGINT_TYPE => {
+                            if let Some(entry) = object.get(BIGINT_VALUE_KEY) {
+                                match entry {
+                                    JSValue::String(value) => {
+                                        let parsed = BigInt::parse_bytes(value.as_bytes(), 10)
+                                            .ok_or_else(|| {
+                                                de::Error::custom(format!(
+                                                    "Invalid BigInt literal '{}'",
+                                                    value
+                                                ))
+                                            })?;
+                                        return Ok(JSValue::BigInt(parsed));
+                                    }
+                                    JSValue::Int(i) => {
+                                        return Ok(JSValue::BigInt(BigInt::from(*i)));
+                                    }
+                                    other => {
+                                        return Err(de::Error::custom(format!(
+                                            "Invalid BigInt payload: expected string, got {:?}",
+                                            other
+                                        )));
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                if let Some(tag_value) = tag {
+                    object.insert(TYPE_TAG.to_string(), JSValue::String(tag_value));
+                }
+
+                Ok(JSValue::Object(object))
             }
         }
 

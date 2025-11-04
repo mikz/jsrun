@@ -8,8 +8,10 @@ surface promise/timeouts/errors consistently with the Rust core.
 
 import math
 import time
+from datetime import datetime, timezone
+
 import pytest
-from jsrun import Runtime
+from jsrun import JsUndefined, Runtime, undefined
 
 
 class TestRuntimeBasics:
@@ -202,6 +204,98 @@ class TestRuntimeConcurrent:
                 runtime.close()
 
 
+class TestRuntimeConversions:
+    """Tests covering rich value conversions between Python and JavaScript."""
+
+    def test_uint8array_to_bytes(self):
+        with Runtime() as runtime:
+            result = runtime.eval("new Uint8Array([1, 2, 3, 4])")
+            assert isinstance(result, bytes)
+            assert result == b"\x01\x02\x03\x04"
+
+    @pytest.mark.asyncio
+    async def test_bytes_round_trip(self):
+        runtime = Runtime()
+        try:
+            echo = runtime.eval("(input) => input")
+            result = await echo(b"\x00\xff")
+            assert isinstance(result, bytes)
+            assert result == b"\x00\xff"
+        finally:
+            runtime.close()
+
+    def test_js_date_to_python_datetime(self):
+        with Runtime() as runtime:
+            result = runtime.eval("new Date(1704067200000)")
+            expected = datetime.fromtimestamp(1704067200, tz=timezone.utc)
+            assert isinstance(result, datetime)
+            assert result == expected
+            assert result.tzinfo == timezone.utc
+
+    @pytest.mark.asyncio
+    async def test_python_datetime_to_js_date(self):
+        runtime = Runtime()
+        try:
+            millis = runtime.eval("(value) => value.getTime()")
+            dt = datetime(2024, 1, 1, 12, 0, tzinfo=timezone.utc)
+            result = await millis(dt)
+            assert result == int(dt.timestamp() * 1000)
+        finally:
+            runtime.close()
+
+    def test_js_set_to_python_set(self):
+        with Runtime() as runtime:
+            result = runtime.eval("new Set([1, 2, 3, 4])")
+            assert isinstance(result, set)
+            assert result == {1, 2, 3, 4}
+
+    @pytest.mark.asyncio
+    async def test_python_set_to_js_set(self):
+        runtime = Runtime()
+        try:
+            to_array = runtime.eval("(value) => Array.from(value)")
+            result = await to_array({3, 1, 2})
+            assert isinstance(result, list)
+            assert set(result) == {1, 2, 3}
+        finally:
+            runtime.close()
+
+    def test_js_undefined_singleton(self):
+        with Runtime() as runtime:
+            result = runtime.eval("undefined")
+            assert isinstance(result, JsUndefined)
+            assert result is undefined
+            assert bool(result) is False
+
+    @pytest.mark.asyncio
+    async def test_python_undefined_to_js(self):
+        runtime = Runtime()
+        try:
+            check = runtime.eval("(value) => value === undefined")
+            result = await check(undefined)
+            assert result is True
+        finally:
+            runtime.close()
+
+    def test_js_bigint_to_python_int(self):
+        with Runtime() as runtime:
+            result = runtime.eval("2n ** 200n")
+            assert isinstance(result, int)
+            assert result == 2**200
+
+    @pytest.mark.asyncio
+    async def test_python_int_to_js_bigint(self):
+        runtime = Runtime()
+        try:
+            check = runtime.eval(
+                "(value) => (typeof value === 'bigint') && value === 2n ** 200n"
+            )
+            result = await check(2**200)
+            assert result is True
+        finally:
+            runtime.close()
+
+
 class TestRuntimeBindings:
     """Tests for the decorator-style binding helper."""
 
@@ -284,7 +378,7 @@ class TestRuntimeEdgeCases:
         runtime = Runtime()
         try:
             result = runtime.eval("undefined")
-            assert result is None
+            assert result is undefined
         finally:
             runtime.close()
 
@@ -331,8 +425,8 @@ class TestRuntimeEdgeCases:
         runtime = Runtime()
         try:
             result = runtime.eval("")
-            # Empty script returns undefined -> None
-            assert result is None
+            # Empty script returns undefined sentinel
+            assert result is undefined
         finally:
             runtime.close()
 
@@ -757,7 +851,7 @@ class TestRuntimeNativeTypes:
             ("true", True),
             ("false", False),
             ("null", None),
-            ("undefined", None),
+            ("undefined", undefined),
             ("[1, 2, 3]", [1, 2, 3]),
             ("({foo: 'bar'})", {"foo": "bar"}),
             ("({nested: {value: 42}})", {"nested": {"value": 42}}),
@@ -770,7 +864,7 @@ class TestRuntimeNativeTypes:
         with Runtime() as runtime:
             result = runtime.eval(source)
             assert result == expected
-            assert type(result) == type(expected)
+            assert isinstance(result, type(expected))
 
     @pytest.mark.parametrize(
         "source, expected",
@@ -787,7 +881,7 @@ class TestRuntimeNativeTypes:
         with Runtime() as runtime:
             result = await runtime.eval_async(source)
             assert result == expected
-            assert type(result) == type(expected)
+            assert isinstance(result, type(expected))
 
     def test_eval_function_raises_error(self):
         """Test that functions raise appropriate errors."""
@@ -809,16 +903,12 @@ class TestRuntimeNativeTypes:
                 or "depth" in str(exc_info.value).lower()
             )
 
-    def test_eval_bigint_overflow_raises_error(self):
-        """Test that BigInt overflow raises appropriate errors."""
+    def test_eval_bigint_handles_large_values(self):
+        """Test that BigInt values round-trip without overflow."""
         with Runtime() as runtime:
-            # Create a BigInt larger than i64::MAX
-            with pytest.raises(RuntimeError) as exc_info:
-                runtime.eval(f"{2**63}n")
-            assert (
-                "overflow" in str(exc_info.value).lower()
-                or "bigint" in str(exc_info.value).lower()
-            )
+            result = runtime.eval(f"{2**63}n")
+            assert isinstance(result, int)
+            assert result == 2**63
 
     def test_eval_nan_infinity_survives(self):
         """Test that NaN and Infinity survive round-trip."""

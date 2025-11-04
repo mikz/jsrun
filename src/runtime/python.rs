@@ -8,10 +8,49 @@ use super::ops::PythonOpMode;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3_async_runtimes::tokio;
+use std::sync::OnceLock;
 
 #[pyclass(unsendable)]
 pub struct Runtime {
     handle: std::cell::RefCell<Option<RuntimeHandle>>,
+}
+
+static JS_UNDEFINED_SINGLETON: OnceLock<Py<JsUndefined>> = OnceLock::new();
+
+#[pyclass(module = "_jsrun")]
+pub struct JsUndefined;
+
+#[pymethods]
+impl JsUndefined {
+    #[new]
+    fn __new__() -> PyResult<Self> {
+        Err(PyRuntimeError::new_err(
+            "JsUndefined is a singleton; use jsrun.undefined",
+        ))
+    }
+
+    fn __repr__(&self) -> &'static str {
+        "JsUndefined"
+    }
+
+    fn __str__(&self) -> &'static str {
+        "undefined"
+    }
+
+    fn __bool__(&self) -> bool {
+        false
+    }
+}
+
+pub(crate) fn get_js_undefined(py: Python<'_>) -> PyResult<Py<JsUndefined>> {
+    if let Some(existing) = JS_UNDEFINED_SINGLETON.get() {
+        Ok(existing.clone_ref(py))
+    } else {
+        let value = Py::new(py, JsUndefined)?;
+        let stored = value.clone_ref(py);
+        let _ = JS_UNDEFINED_SINGLETON.set(stored);
+        Ok(value)
+    }
 }
 
 impl Runtime {
@@ -61,9 +100,11 @@ impl Runtime {
 
 fn js_value_to_js_expression(value: &JSValue) -> PyResult<String> {
     match value {
+        JSValue::Undefined => Ok("undefined".to_string()),
         JSValue::Null => Ok("null".to_string()),
         JSValue::Bool(b) => Ok(b.to_string()),
         JSValue::Int(i) => Ok(i.to_string()),
+        JSValue::BigInt(bigint) => Ok(format!("BigInt(\"{}\")", bigint.to_str_radix(10))),
         JSValue::Float(f) => {
             if f.is_nan() {
                 Ok("Number.NaN".to_string())
@@ -80,12 +121,24 @@ fn js_value_to_js_expression(value: &JSValue) -> PyResult<String> {
         JSValue::String(s) => serde_json::to_string(s).map_err(|e| {
             PyRuntimeError::new_err(format!("Failed to serialize string literal: {e}"))
         }),
+        JSValue::Bytes(bytes) => serde_json::to_string(bytes)
+            .map(|data| format!("new Uint8Array({data})"))
+            .map_err(|e| {
+                PyRuntimeError::new_err(format!("Failed to serialize bytes literal: {e}"))
+            }),
         JSValue::Array(items) => {
             let mut parts = Vec::with_capacity(items.len());
             for item in items {
                 parts.push(js_value_to_js_expression(item)?);
             }
             Ok(format!("[{}]", parts.join(", ")))
+        }
+        JSValue::Set(items) => {
+            let mut parts = Vec::with_capacity(items.len());
+            for item in items {
+                parts.push(js_value_to_js_expression(item)?);
+            }
+            Ok(format!("new Set([{}])", parts.join(", ")))
         }
         JSValue::Object(map) => {
             let mut parts = Vec::with_capacity(map.len());
@@ -98,6 +151,7 @@ fn js_value_to_js_expression(value: &JSValue) -> PyResult<String> {
             }
             Ok(format!("{{{}}}", parts.join(", ")))
         }
+        JSValue::Date(epoch_ms) => Ok(format!("new Date({epoch_ms})")),
         JSValue::Function { .. } => Err(PyRuntimeError::new_err(
             "Cannot serialize function values; use callables directly",
         )),

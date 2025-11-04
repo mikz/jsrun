@@ -214,11 +214,82 @@ pub fn python_extension(registry: PythonOpRegistry) -> Extension {
     let bridge_code = ascii_str!(
         r#"(function (globalThis) {
   const { ops } = Deno.core;
+  function prepare(value) {
+    if (value === undefined || value === null) {
+      return value;
+    }
+    if (ArrayBuffer.isView(value)) {
+      return value;
+    }
+    if (Array.isArray(value)) {
+      return value.map(prepare);
+    }
+    if (value instanceof Date) {
+      return { __jsrun_type: "Date", epoch_ms: value.valueOf() };
+    }
+    if (value instanceof Set) {
+      return {
+        __jsrun_type: "Set",
+        values: Array.from(value, (entry) => prepare(entry)),
+      };
+    }
+    if (typeof value === "bigint") {
+      return { __jsrun_type: "BigInt", value: value.toString() };
+    }
+    if (typeof value === "object") {
+      const result = {};
+      for (const [key, val] of Object.entries(value)) {
+        result[key] = prepare(val);
+      }
+      return result;
+    }
+    return value;
+  }
+
+  function revive(value) {
+    if (value && typeof value === "object") {
+      if (ArrayBuffer.isView(value)) {
+        return value;
+      }
+      if (Array.isArray(value)) {
+        return value.map(revive);
+      }
+      const tag = value.__jsrun_type;
+      switch (tag) {
+        case "Undefined":
+          return undefined;
+        case "Date":
+          return new Date(value.epoch_ms);
+        case "Set": {
+          const set = new Set();
+          if (Array.isArray(value.values)) {
+            for (const entry of value.values) {
+              set.add(revive(entry));
+            }
+          }
+          return set;
+        }
+        case "BigInt":
+          return BigInt(value.value);
+        default: {
+          const result = {};
+          for (const [key, val] of Object.entries(value)) {
+            result[key] = revive(val);
+          }
+          return result;
+        }
+      }
+    }
+    return value;
+  }
+
   globalThis.__jsrunCallSync = function (opId, ...args) {
-    return ops.op_jsrun_call_python_sync(opId, args);
+    const prepared = args.map(prepare);
+    return revive(ops.op_jsrun_call_python_sync(opId, prepared));
   };
   globalThis.__jsrunCallAsync = function (opId, ...args) {
-    return ops.op_jsrun_call_python_async(opId, args);
+    const prepared = args.map(prepare);
+    return ops.op_jsrun_call_python_async(opId, prepared).then(revive);
   };
   globalThis.__host_op_sync__ = globalThis.__jsrunCallSync;
   globalThis.__host_op_async__ = function (opId, ...args) {

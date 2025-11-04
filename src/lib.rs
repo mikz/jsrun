@@ -9,6 +9,9 @@ mod runtime;
 fn _jsrun(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<runtime::python::Runtime>()?;
     m.add_class::<runtime::python::JsFunction>()?;
+    m.add_class::<runtime::python::JsUndefined>()?;
     m.add_class::<runtime::RuntimeConfig>()?;
+    let undefined: Py<PyAny> = runtime::python::get_js_undefined(m.py())?.into();
+    m.add("undefined", undefined)?;
     Ok(())
 }

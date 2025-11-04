@@ -56,6 +56,12 @@ The project has three distinct layers that communicate via well-defined boundari
 2. **Rust-Python Bridge** (`src/runtime/python.rs`, `src/lib.rs`): PyO3 bindings
 3. **Python API** (`python/jsrun/__init__.py`): User-facing interface
 
+### Type Conversion Notes
+
+- JavaScript `undefined` now round-trips via the `JsUndefined` sentinel (`jsrun.undefined`), distinct from Python `None` / JS `null`.
+- Binary types (`Uint8Array`, `ArrayBuffer`) map to Python `bytes`; Python `bytes`, `bytearray`, and `memoryview` map back to `Uint8Array`.
+- Temporal values (`Date` ↔ `datetime`), sets (`Set` ↔ `set`), and arbitrary precision integers (`BigInt` ↔ Python `int`) are handled natively, including op arguments/results.
+
 ### Threading Model
 
 Each JavaScript runtime runs on a **dedicated OS thread** with its own:

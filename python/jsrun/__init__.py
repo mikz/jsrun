@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Optional, TypeVar, overload
 
-from ._jsrun import Runtime, RuntimeConfig
+from ._jsrun import JsFunction, JsUndefined, Runtime, RuntimeConfig, undefined
 
 F = TypeVar("F", bound=Callable[..., Any])
 
@@ -48,6 +48,9 @@ def _runtime_bind(
 setattr(Runtime, "bind", _runtime_bind)
 
 __all__ = [
+    "JsFunction",
+    "JsUndefined",
     "Runtime",
     "RuntimeConfig",
+    "undefined",
 ]

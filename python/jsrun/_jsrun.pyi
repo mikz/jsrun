@@ -9,6 +9,8 @@ __all__ = [
     "Runtime",
     "RuntimeConfig",
     "JsFunction",
+    "JsUndefined",
+    "undefined",
 ]
 
 F = TypeVar("F", bound=Callable[..., Any])
@@ -117,6 +119,17 @@ class JsFunction:
         ...
 
     def __repr__(self) -> str: ...
+
+class JsUndefined:
+    """
+    Sentinel representing the JavaScript ``undefined`` value in Python.
+    """
+
+    def __bool__(self) -> bool: ...
+    def __repr__(self) -> str: ...
+    def __str__(self) -> str: ...
+
+undefined: JsUndefined
 
 class Runtime:
     """
