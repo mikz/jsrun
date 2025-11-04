@@ -1,6 +1,7 @@
 //! Python-facing handle for interacting with the runtime thread.
 
 use crate::runtime::config::RuntimeConfig;
+use crate::runtime::error::{RuntimeError, RuntimeResult};
 use crate::runtime::js_value::JSValue;
 use crate::runtime::ops::PythonOpMode;
 use crate::runtime::runner::{spawn_runtime_thread, RuntimeCommand};
@@ -20,7 +21,7 @@ pub struct RuntimeHandle {
 }
 
 impl RuntimeHandle {
-    pub fn spawn(config: RuntimeConfig) -> Result<Self, String> {
+    pub fn spawn(config: RuntimeConfig) -> RuntimeResult<Self> {
         let tx = spawn_runtime_thread(config)?;
         Ok(Self {
             tx: Some(tx),
@@ -28,16 +29,16 @@ impl RuntimeHandle {
         })
     }
 
-    fn sender(&self) -> Result<&async_mpsc::UnboundedSender<RuntimeCommand>, String> {
+    fn sender(&self) -> RuntimeResult<&async_mpsc::UnboundedSender<RuntimeCommand>> {
         if *self.shutdown.lock().unwrap() {
-            return Err("Runtime has been shut down".to_string());
+            return Err(RuntimeError::internal("Runtime has been shut down"));
         }
         self.tx
             .as_ref()
-            .ok_or_else(|| "Runtime has been shut down".to_string())
+            .ok_or_else(|| RuntimeError::internal("Runtime has been shut down"))
     }
 
-    pub fn eval_sync(&self, code: &str) -> Result<JSValue, String> {
+    pub fn eval_sync(&self, code: &str) -> RuntimeResult<JSValue> {
         let sender = self.sender()?.clone();
         let (result_tx, result_rx) = mpsc::channel();
 
@@ -46,11 +47,11 @@ impl RuntimeHandle {
                 code: code.to_string(),
                 responder: result_tx,
             })
-            .map_err(|_| "Failed to send eval command".to_string())?;
+            .map_err(|_| RuntimeError::internal("Failed to send eval command"))?;
 
         result_rx
             .recv()
-            .map_err(|_| "Failed to receive eval result".to_string())?
+            .map_err(|_| RuntimeError::internal("Failed to receive eval result"))?
     }
 
     pub async fn eval_async(
@@ -58,7 +59,7 @@ impl RuntimeHandle {
         code: &str,
         timeout_ms: Option<u64>,
         task_locals: Option<TaskLocals>,
-    ) -> Result<JSValue, String> {
+    ) -> RuntimeResult<JSValue> {
         let sender = self.sender()?.clone();
         let (result_tx, result_rx) = oneshot::channel();
 
@@ -69,11 +70,11 @@ impl RuntimeHandle {
                 task_locals,
                 responder: result_tx,
             })
-            .map_err(|_| "Failed to send eval_async command".to_string())?;
+            .map_err(|_| RuntimeError::internal("Failed to send eval_async command"))?;
 
         result_rx
             .await
-            .map_err(|_| "Failed to receive async eval result".to_string())?
+            .map_err(|_| RuntimeError::internal("Failed to receive async eval result"))?
     }
 
     pub fn register_op(
@@ -81,7 +82,7 @@ impl RuntimeHandle {
         name: String,
         mode: PythonOpMode,
         handler: Py<PyAny>,
-    ) -> Result<u32, String> {
+    ) -> RuntimeResult<u32> {
         let sender = self.sender()?.clone();
         let (result_tx, result_rx) = mpsc::channel();
 
@@ -92,14 +93,14 @@ impl RuntimeHandle {
                 handler,
                 responder: result_tx,
             })
-            .map_err(|_| "Failed to send register_op command".to_string())?;
+            .map_err(|_| RuntimeError::internal("Failed to send register_op command"))?;
 
         result_rx
             .recv()
-            .map_err(|_| "Failed to receive op registration result".to_string())?
+            .map_err(|_| RuntimeError::internal("Failed to receive op registration result"))?
     }
 
-    pub fn set_module_resolver(&self, handler: Py<PyAny>) -> Result<(), String> {
+    pub fn set_module_resolver(&self, handler: Py<PyAny>) -> RuntimeResult<()> {
         let sender = self.sender()?.clone();
         let (result_tx, result_rx) = mpsc::channel();
 
@@ -108,14 +109,14 @@ impl RuntimeHandle {
                 handler,
                 responder: result_tx,
             })
-            .map_err(|_| "Failed to send set_module_resolver command".to_string())?;
+            .map_err(|_| RuntimeError::internal("Failed to send set_module_resolver command"))?;
 
         result_rx
             .recv()
-            .map_err(|_| "Failed to receive set_module_resolver result".to_string())?
+            .map_err(|_| RuntimeError::internal("Failed to receive set_module_resolver result"))?
     }
 
-    pub fn set_module_loader(&self, handler: Py<PyAny>) -> Result<(), String> {
+    pub fn set_module_loader(&self, handler: Py<PyAny>) -> RuntimeResult<()> {
         let sender = self.sender()?.clone();
         let (result_tx, result_rx) = mpsc::channel();
 
@@ -124,14 +125,14 @@ impl RuntimeHandle {
                 handler,
                 responder: result_tx,
             })
-            .map_err(|_| "Failed to send set_module_loader command".to_string())?;
+            .map_err(|_| RuntimeError::internal("Failed to send set_module_loader command"))?;
 
         result_rx
             .recv()
-            .map_err(|_| "Failed to receive set_module_loader result".to_string())?
+            .map_err(|_| RuntimeError::internal("Failed to receive set_module_loader result"))?
     }
 
-    pub fn add_static_module(&self, name: String, source: String) -> Result<(), String> {
+    pub fn add_static_module(&self, name: String, source: String) -> RuntimeResult<()> {
         let sender = self.sender()?.clone();
         let (result_tx, result_rx) = mpsc::channel();
 
@@ -141,14 +142,14 @@ impl RuntimeHandle {
                 source,
                 responder: result_tx,
             })
-            .map_err(|_| "Failed to send add_static_module command".to_string())?;
+            .map_err(|_| RuntimeError::internal("Failed to send add_static_module command"))?;
 
         result_rx
             .recv()
-            .map_err(|_| "Failed to receive add_static_module result".to_string())?
+            .map_err(|_| RuntimeError::internal("Failed to receive add_static_module result"))?
     }
 
-    pub fn eval_module_sync(&self, specifier: &str) -> Result<JSValue, String> {
+    pub fn eval_module_sync(&self, specifier: &str) -> RuntimeResult<JSValue> {
         let sender = self.sender()?.clone();
         let (result_tx, result_rx) = mpsc::channel();
 
@@ -157,11 +158,11 @@ impl RuntimeHandle {
                 specifier: specifier.to_string(),
                 responder: result_tx,
             })
-            .map_err(|_| "Failed to send eval_module command".to_string())?;
+            .map_err(|_| RuntimeError::internal("Failed to send eval_module command"))?;
 
         result_rx
             .recv()
-            .map_err(|_| "Failed to receive eval_module result".to_string())?
+            .map_err(|_| RuntimeError::internal("Failed to receive eval_module result"))?
     }
 
     pub async fn eval_module_async(
@@ -169,7 +170,7 @@ impl RuntimeHandle {
         specifier: &str,
         timeout_ms: Option<u64>,
         task_locals: Option<TaskLocals>,
-    ) -> Result<JSValue, String> {
+    ) -> RuntimeResult<JSValue> {
         let sender = self.sender()?.clone();
         let (result_tx, result_rx) = oneshot::channel();
 
@@ -180,11 +181,11 @@ impl RuntimeHandle {
                 task_locals,
                 responder: result_tx,
             })
-            .map_err(|_| "Failed to send eval_module_async command".to_string())?;
+            .map_err(|_| RuntimeError::internal("Failed to send eval_module_async command"))?;
 
         result_rx
             .await
-            .map_err(|_| "Failed to receive async eval_module result".to_string())?
+            .map_err(|_| RuntimeError::internal("Failed to receive async eval_module result"))?
     }
 
     // Call a JavaScript function asynchronously.
@@ -198,7 +199,7 @@ impl RuntimeHandle {
         args: Vec<JSValue>,
         timeout_ms: Option<u64>,
         task_locals: Option<TaskLocals>,
-    ) -> Result<JSValue, String> {
+    ) -> RuntimeResult<JSValue> {
         let sender = self.sender()?.clone();
         let (result_tx, result_rx) = oneshot::channel();
 
@@ -210,15 +211,15 @@ impl RuntimeHandle {
                 task_locals,
                 responder: result_tx,
             })
-            .map_err(|_| "Failed to send call_function command".to_string())?;
+            .map_err(|_| RuntimeError::internal("Failed to send call_function command"))?;
 
         result_rx
             .await
-            .map_err(|_| "Failed to receive function call result".to_string())?
+            .map_err(|_| RuntimeError::internal("Failed to receive function call result"))?
     }
 
     /// Release a function handle so the underlying V8 global can be dropped.
-    pub async fn release_function_async(&self, fn_id: u32) -> Result<(), String> {
+    pub async fn release_function_async(&self, fn_id: u32) -> RuntimeResult<()> {
         let sender = self.sender()?.clone();
         let (result_tx, result_rx) = oneshot::channel();
 
@@ -227,18 +228,18 @@ impl RuntimeHandle {
                 fn_id,
                 responder: result_tx,
             })
-            .map_err(|_| "Failed to send release_function command".to_string())?;
+            .map_err(|_| RuntimeError::internal("Failed to send release_function command"))?;
 
         result_rx
             .await
-            .map_err(|_| "Failed to receive release result".to_string())?
+            .map_err(|_| RuntimeError::internal("Failed to receive release result"))?
     }
 
     pub fn is_shutdown(&self) -> bool {
         *self.shutdown.lock().unwrap()
     }
 
-    pub fn close(&mut self) -> Result<(), String> {
+    pub fn close(&mut self) -> RuntimeResult<()> {
         let mut shutdown_guard = self.shutdown.lock().unwrap();
         if *shutdown_guard {
             return Ok(());
@@ -252,7 +253,7 @@ impl RuntimeHandle {
                 })
                 .is_err()
             {
-                return Err("Failed to send shutdown command".to_string());
+                return Err(RuntimeError::internal("Failed to send shutdown command"));
             }
 
             match result_rx.recv() {
@@ -260,7 +261,7 @@ impl RuntimeHandle {
                     *shutdown_guard = true;
                 }
                 Err(_) => {
-                    return Err("Failed to confirm runtime shutdown".to_string());
+                    return Err(RuntimeError::internal("Failed to confirm runtime shutdown"));
                 }
             }
         }

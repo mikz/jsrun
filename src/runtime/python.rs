@@ -2,11 +2,14 @@
 
 use super::config::RuntimeConfig;
 use super::conversion::{js_value_to_python, python_to_js_value};
+use super::error::{JsExceptionDetails, RuntimeError};
 use super::handle::RuntimeHandle;
 use super::js_value::JSValue;
 use super::ops::PythonOpMode;
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::create_exception;
+use pyo3::exceptions::{PyException, PyRuntimeError};
 use pyo3::prelude::*;
+use pyo3::types::{PyDict, PyList};
 use pyo3_async_runtimes::tokio;
 use std::sync::OnceLock;
 
@@ -16,6 +19,81 @@ pub struct Runtime {
 }
 
 static JS_UNDEFINED_SINGLETON: OnceLock<Py<JsUndefined>> = OnceLock::new();
+
+create_exception!(crate::runtime::python, JavaScriptError, PyException);
+
+fn set_optional_attr(py: Python<'_>, value: &Bound<'_, PyAny>, name: &str, attr: Option<String>) {
+    match attr {
+        Some(val) => {
+            let _ = value.setattr(name, val);
+        }
+        None => {
+            let _ = value.setattr(name, py.None());
+        }
+    }
+}
+
+fn build_js_exception(py: Python<'_>, details: JsExceptionDetails, context: Option<&str>) -> PyErr {
+    let summary = match context {
+        Some(prefix) if !prefix.is_empty() => format!("{prefix}: {}", details.summary()),
+        _ => details.summary(),
+    };
+    let py_err = PyErr::new::<JavaScriptError, _>(summary);
+    let value = py_err.value(py);
+
+    set_optional_attr(py, value, "name", details.name.clone());
+    set_optional_attr(py, value, "message", details.message.clone());
+    set_optional_attr(py, value, "stack", details.stack.clone());
+
+    let frames_list = PyList::empty(py);
+    for frame in &details.frames {
+        let frame_dict = PyDict::new(py);
+        if let Some(function_name) = &frame.function_name {
+            let _ = frame_dict.set_item("function_name", function_name);
+        }
+        if let Some(file_name) = &frame.file_name {
+            let _ = frame_dict.set_item("file_name", file_name);
+        }
+        if let Some(line_number) = frame.line_number {
+            let _ = frame_dict.set_item("line_number", line_number);
+        }
+        if let Some(column_number) = frame.column_number {
+            let _ = frame_dict.set_item("column_number", column_number);
+        }
+        let _ = frames_list.append(frame_dict);
+    }
+    let _ = value.setattr("frames", frames_list);
+
+    py_err
+}
+
+fn runtime_error_to_py_with(py: Python<'_>, err: RuntimeError, context: Option<&str>) -> PyErr {
+    match err {
+        RuntimeError::JavaScript(details) => build_js_exception(py, details, context),
+        RuntimeError::Timeout { context: msg } => {
+            let message = match context {
+                Some(prefix) => format!("{prefix}: {msg}"),
+                None => msg,
+            };
+            PyRuntimeError::new_err(message)
+        }
+        RuntimeError::Internal { context: msg } => {
+            let message = match context {
+                Some(prefix) => format!("{prefix}: {msg}"),
+                None => msg,
+            };
+            PyRuntimeError::new_err(message)
+        }
+    }
+}
+
+pub(crate) fn runtime_error_to_py(err: RuntimeError) -> PyErr {
+    Python::attach(|py| runtime_error_to_py_with(py, err, None))
+}
+
+pub(crate) fn runtime_error_with_context(context: &str, err: RuntimeError) -> PyErr {
+    Python::attach(|py| runtime_error_to_py_with(py, err, Some(context)))
+}
 
 #[pyclass(module = "_jsrun")]
 pub struct JsUndefined;
@@ -56,7 +134,7 @@ pub(crate) fn get_js_undefined(py: Python<'_>) -> PyResult<Py<JsUndefined>> {
 impl Runtime {
     fn init_with_config(config: RuntimeConfig) -> PyResult<Self> {
         let handle = RuntimeHandle::spawn(config)
-            .map_err(|e| PyRuntimeError::new_err(format!("Failed to spawn runtime: {}", e)))?;
+            .map_err(|err| runtime_error_with_context("Failed to spawn runtime", err))?;
         Ok(Self {
             handle: std::cell::RefCell::new(Some(handle)),
         })
@@ -193,7 +271,7 @@ impl Runtime {
             let js_result = handle
                 .eval_async(&code, timeout_ms, task_locals)
                 .await
-                .map_err(|e| PyRuntimeError::new_err(format!("Evaluation failed: {}", e)))?;
+                .map_err(|e| runtime_error_with_context("Evaluation failed", e))?;
 
             // Convert JSValue to Python in the current Python context
             Python::attach(|py| js_value_to_python(py, &js_result, Some(&handle_for_conversion)))
@@ -212,7 +290,7 @@ impl Runtime {
         let code_owned = code.to_owned();
         let js_value = py
             .detach(|| handle.eval_sync(&code_owned))
-            .map_err(|e| PyRuntimeError::new_err(format!("Evaluation failed: {}", e)))?;
+            .map_err(|e| runtime_error_with_context("Evaluation failed", e))?;
         js_value_to_python(py, &js_value, Some(&handle))
     }
 
@@ -229,7 +307,7 @@ impl Runtime {
         if let Some(mut runtime) = handle.take() {
             runtime
                 .close()
-                .map_err(|e| PyRuntimeError::new_err(format!("Shutdown failed: {}", e)))?;
+                .map_err(|e| runtime_error_with_context("Shutdown failed", e))?;
         }
         Ok(())
     }
@@ -254,7 +332,7 @@ impl Runtime {
 
         handle
             .register_op(name, mode_enum, handler_clone)
-            .map_err(|e| PyRuntimeError::new_err(format!("Op registration failed: {}", e)))
+            .map_err(|e| runtime_error_with_context("Op registration failed", e))
     }
 
     #[pyo3(signature = (name, handler))]
@@ -276,7 +354,7 @@ impl Runtime {
 
         let op_id = handle
             .register_op(name.clone(), mode_enum, handler_clone)
-            .map_err(|e| PyRuntimeError::new_err(format!("Op registration failed: {}", e)))?;
+            .map_err(|e| runtime_error_with_context("Op registration failed", e))?;
 
         let bridge_name = match mode_enum {
             PythonOpMode::Sync => "__host_op_sync__",
@@ -332,9 +410,7 @@ impl Runtime {
                 let op_name = format!("{name}.{key_str}");
                 let op_id = handle
                     .register_op(op_name, mode_enum, handler_py)
-                    .map_err(|e| {
-                        PyRuntimeError::new_err(format!("Op registration failed: {}", e))
-                    })?;
+                    .map_err(|e| runtime_error_with_context("Op registration failed", e))?;
 
                 let bridge_name = match mode_enum {
                     PythonOpMode::Sync => "__host_op_sync__",
@@ -380,9 +456,9 @@ impl Runtime {
             .ok_or_else(|| PyRuntimeError::new_err("Runtime has been closed"))?
             .clone();
 
-        handle.set_module_resolver(resolver).map_err(|e| {
-            PyRuntimeError::new_err(format!("Failed to set module resolver: {}", e))
-        })?;
+        handle
+            .set_module_resolver(resolver)
+            .map_err(|e| runtime_error_with_context("Failed to set module resolver", e))?;
         Ok(())
     }
 
@@ -396,7 +472,7 @@ impl Runtime {
 
         handle
             .set_module_loader(loader)
-            .map_err(|e| PyRuntimeError::new_err(format!("Failed to set module loader: {}", e)))?;
+            .map_err(|e| runtime_error_with_context("Failed to set module loader", e))?;
         Ok(())
     }
 
@@ -410,7 +486,7 @@ impl Runtime {
 
         handle
             .add_static_module(name, source)
-            .map_err(|e| PyRuntimeError::new_err(format!("Failed to add static module: {}", e)))?;
+            .map_err(|e| runtime_error_with_context("Failed to add static module", e))?;
         Ok(())
     }
 
@@ -424,7 +500,7 @@ impl Runtime {
         let specifier_owned = specifier.to_owned();
         let js_value = py
             .detach(|| handle.eval_module_sync(&specifier_owned))
-            .map_err(|e| PyRuntimeError::new_err(format!("Module evaluation failed: {}", e)))?;
+            .map_err(|e| runtime_error_with_context("Module evaluation failed", e))?;
         js_value_to_python(py, &js_value, Some(&handle))
     }
 
@@ -451,7 +527,7 @@ impl Runtime {
             let js_result = handle
                 .eval_module_async(&specifier, timeout_ms, task_locals)
                 .await
-                .map_err(|e| PyRuntimeError::new_err(format!("Module evaluation failed: {}", e)))?;
+                .map_err(|e| runtime_error_with_context("Module evaluation failed", e))?;
 
             // Convert JSValue to Python in the current Python context
             Python::attach(|py| js_value_to_python(py, &js_result, Some(&handle_for_conversion)))
@@ -572,7 +648,7 @@ impl JsFunction {
             let js_result = handle
                 .call_function_async(fn_id, js_args, timeout_ms, task_locals)
                 .await
-                .map_err(|e| PyRuntimeError::new_err(format!("Function call failed: {}", e)))?;
+                .map_err(|e| runtime_error_with_context("Function call failed", e))?;
 
             // Convert JSValue result to Python
             Python::attach(|py| js_value_to_python(py, &js_result, Some(&handle_for_conversion)))
@@ -604,7 +680,7 @@ impl JsFunction {
             handle
                 .release_function_async(fn_id)
                 .await
-                .map_err(|e| PyRuntimeError::new_err(format!("Failed to release function: {}", e)))
+                .map_err(|e| runtime_error_with_context("Failed to release function", e))
         };
 
         pyo3_async_runtimes::tokio::future_into_py(py, future)

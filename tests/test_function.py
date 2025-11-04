@@ -1,7 +1,7 @@
 """Tests for JavaScript function calling from Python."""
 
 import pytest
-from jsrun import Runtime
+from jsrun import JavaScriptError, Runtime
 
 
 @pytest.mark.asyncio
@@ -83,8 +83,12 @@ async def test_function_error_handling():
         js_func = rt.eval("(x) => { throw new Error('Test error: ' + x); }")
 
         # Should propagate JavaScript errors
-        with pytest.raises(RuntimeError, match="Function call failed"):
+        with pytest.raises(JavaScriptError) as exc_info:
             await js_func(42)
+        js_error = exc_info.value
+        assert js_error.name == "Error"
+        assert "Test error: 42" in js_error.message
+        assert js_error.stack is not None
 
 
 @pytest.mark.asyncio

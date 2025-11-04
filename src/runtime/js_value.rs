@@ -4,6 +4,7 @@
 //! represent JavaScript values including NaN, ±Infinity, and properly detect
 //! circular references and enforce depth/size limits.
 
+use crate::runtime::error::{RuntimeError, RuntimeResult};
 use indexmap::IndexMap;
 use num_bigint::BigInt;
 use serde::ser::SerializeMap;
@@ -289,13 +290,13 @@ impl LimitTracker {
     /// Enter a new depth level.
     ///
     /// Returns an error if the depth limit is exceeded.
-    pub fn enter(&mut self) -> Result<(), String> {
+    pub fn enter(&mut self) -> RuntimeResult<()> {
         self.current_depth += 1;
         if self.current_depth > self.max_depth {
-            return Err(format!(
+            return Err(RuntimeError::internal(format!(
                 "Depth exceeded maximum limit of {}",
                 self.max_depth
-            ));
+            )));
         }
         Ok(())
     }
@@ -308,13 +309,13 @@ impl LimitTracker {
     /// Add to the byte count.
     ///
     /// Returns an error if the size limit is exceeded.
-    pub fn add_bytes(&mut self, bytes: usize) -> Result<(), String> {
+    pub fn add_bytes(&mut self, bytes: usize) -> RuntimeResult<()> {
         self.current_bytes += bytes;
         if self.current_bytes > self.max_bytes {
-            return Err(format!(
+            return Err(RuntimeError::internal(format!(
                 "Size ({} bytes) exceeded maximum limit of {} bytes",
                 self.current_bytes, self.max_bytes
-            ));
+            )));
         }
         Ok(())
     }

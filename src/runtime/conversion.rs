@@ -1,6 +1,7 @@
 //! Conversion helpers between Python objects and JSValue/serde_json values.
 
 use crate::runtime::js_value::{JSValue, LimitTracker, MAX_JS_BYTES, MAX_JS_DEPTH};
+use crate::runtime::python::runtime_error_to_py;
 use indexmap::IndexMap;
 use num_bigint::BigInt;
 use pyo3::conversion::IntoPyObject;
@@ -158,10 +159,10 @@ fn python_to_js_value_internal(
         )));
     }
 
-    tracker.enter().map_err(PyRuntimeError::new_err)?;
+    tracker.enter().map_err(runtime_error_to_py)?;
 
     let add_bytes = |bytes: usize, tracker: &mut LimitTracker| {
-        tracker.add_bytes(bytes).map_err(PyRuntimeError::new_err)
+        tracker.add_bytes(bytes).map_err(runtime_error_to_py)
     };
 
     let py = obj.py();

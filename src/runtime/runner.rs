@@ -5,10 +5,11 @@
 //! [`RuntimeCommand`] and executed sequentially on that thread.
 
 use crate::runtime::config::RuntimeConfig;
+use crate::runtime::error::{JsExceptionDetails, RuntimeError, RuntimeResult};
 use crate::runtime::js_value::{JSValue, LimitTracker, MAX_JS_BYTES, MAX_JS_DEPTH};
 use crate::runtime::loader::PythonModuleLoader;
 use crate::runtime::ops::{python_extension, PythonOpMode, PythonOpRegistry};
-use deno_core::error::CoreError;
+use deno_core::error::JsError;
 use deno_core::{v8, JsRuntime, PollEventLoopOptions, RuntimeOptions};
 use indexmap::IndexMap;
 use num_bigint::{BigInt, Sign};
@@ -26,10 +27,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
-type InitSignalChannel = (
-    StdSender<Result<(), String>>,
-    StdReceiver<Result<(), String>>,
-);
+type InitSignalChannel = (StdSender<RuntimeResult<()>>, StdReceiver<RuntimeResult<()>>);
 
 /// Stored function with optional receiver for 'this' binding
 struct StoredFunction {
@@ -41,53 +39,53 @@ struct StoredFunction {
 pub enum RuntimeCommand {
     Eval {
         code: String,
-        responder: Sender<Result<JSValue, String>>,
+        responder: Sender<RuntimeResult<JSValue>>,
     },
     EvalAsync {
         code: String,
         timeout_ms: Option<u64>,
         task_locals: Option<TaskLocals>,
-        responder: oneshot::Sender<Result<JSValue, String>>,
+        responder: oneshot::Sender<RuntimeResult<JSValue>>,
     },
     EvalModule {
         specifier: String,
-        responder: Sender<Result<JSValue, String>>,
+        responder: Sender<RuntimeResult<JSValue>>,
     },
     EvalModuleAsync {
         specifier: String,
         timeout_ms: Option<u64>,
         task_locals: Option<TaskLocals>,
-        responder: oneshot::Sender<Result<JSValue, String>>,
+        responder: oneshot::Sender<RuntimeResult<JSValue>>,
     },
     RegisterPythonOp {
         name: String,
         mode: PythonOpMode,
         handler: Py<PyAny>,
-        responder: Sender<Result<u32, String>>,
+        responder: Sender<RuntimeResult<u32>>,
     },
     SetModuleResolver {
         handler: Py<PyAny>,
-        responder: Sender<Result<(), String>>,
+        responder: Sender<RuntimeResult<()>>,
     },
     SetModuleLoader {
         handler: Py<PyAny>,
-        responder: Sender<Result<(), String>>,
+        responder: Sender<RuntimeResult<()>>,
     },
     AddStaticModule {
         name: String,
         source: String,
-        responder: Sender<Result<(), String>>,
+        responder: Sender<RuntimeResult<()>>,
     },
     CallFunctionAsync {
         fn_id: u32,
         args: Vec<JSValue>,
         timeout_ms: Option<u64>,
         task_locals: Option<TaskLocals>,
-        responder: oneshot::Sender<Result<JSValue, String>>,
+        responder: oneshot::Sender<RuntimeResult<JSValue>>,
     },
     ReleaseFunction {
         fn_id: u32,
-        responder: oneshot::Sender<Result<(), String>>,
+        responder: oneshot::Sender<RuntimeResult<()>>,
     },
     Shutdown {
         responder: Sender<()>,
@@ -96,7 +94,7 @@ pub enum RuntimeCommand {
 
 pub fn spawn_runtime_thread(
     config: RuntimeConfig,
-) -> Result<mpsc::UnboundedSender<RuntimeCommand>, String> {
+) -> RuntimeResult<mpsc::UnboundedSender<RuntimeCommand>> {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<RuntimeCommand>();
     let (init_tx, init_rx): InitSignalChannel = std::sync::mpsc::channel();
 
@@ -123,12 +121,14 @@ pub fn spawn_runtime_thread(
                 core.run(cmd_rx).await;
             });
         })
-        .map_err(|e| format!("Failed to spawn runtime thread: {}", e))?;
+        .map_err(|e| RuntimeError::internal(format!("Failed to spawn runtime thread: {}", e)))?;
 
     match init_rx.recv() {
         Ok(Ok(())) => Ok(cmd_tx),
         Ok(Err(err)) => Err(err),
-        Err(_) => Err("Runtime thread initialization failed".to_string()),
+        Err(_) => Err(RuntimeError::internal(
+            "Runtime thread initialization failed",
+        )),
     }
 }
 
@@ -143,7 +143,7 @@ struct RuntimeCore {
 }
 
 impl RuntimeCore {
-    fn new(config: RuntimeConfig) -> Result<Self, String> {
+    fn new(config: RuntimeConfig) -> RuntimeResult<Self> {
         let registry = PythonOpRegistry::new();
         let extension = python_extension(registry.clone());
         let module_loader = Rc::new(PythonModuleLoader::new());
@@ -156,15 +156,17 @@ impl RuntimeCore {
         } = config;
 
         if initial_heap_size.is_some() && max_heap_size.is_none() {
-            return Err("initial_heap_size requires max_heap_size to be set as well".to_string());
+            return Err(RuntimeError::internal(
+                "initial_heap_size requires max_heap_size to be set as well",
+            ));
         }
 
         if let (Some(initial), Some(max)) = (initial_heap_size, max_heap_size) {
             if initial > max {
-                return Err(format!(
+                return Err(RuntimeError::internal(format!(
                     "initial_heap_size ({}) cannot exceed max_heap_size ({})",
                     initial, max
-                ));
+                )));
             }
         }
 
@@ -186,7 +188,7 @@ impl RuntimeCore {
         if let Some(script) = bootstrap_script {
             js_runtime
                 .execute_script("<bootstrap>", script)
-                .map_err(|err| err.to_string())?;
+                .map_err(|err| RuntimeError::javascript(JsExceptionDetails::from_js_error(*err)))?;
         }
 
         Ok(Self {
@@ -326,15 +328,15 @@ impl RuntimeCore {
         name: String,
         mode: PythonOpMode,
         handler: Py<PyAny>,
-    ) -> Result<u32, String> {
+    ) -> RuntimeResult<u32> {
         Ok(self.registry.register(name, mode, handler))
     }
 
-    fn eval_sync(&mut self, code: &str) -> Result<JSValue, String> {
+    fn eval_sync(&mut self, code: &str) -> RuntimeResult<JSValue> {
         let global_value = self
             .js_runtime
             .execute_script("<eval>", code.to_string())
-            .map_err(|err| err.to_string())?;
+            .map_err(|err| RuntimeError::javascript(JsExceptionDetails::from_js_error(*err)))?;
 
         let scope = &mut self.js_runtime.handle_scope();
         let local = deno_core::v8::Local::new(scope, global_value);
@@ -345,7 +347,7 @@ impl RuntimeCore {
         &mut self,
         code: String,
         timeout_ms: Option<u64>,
-    ) -> Result<JSValue, String> {
+    ) -> RuntimeResult<JSValue> {
         let timeout_ms = timeout_ms.or_else(|| {
             self.execution_timeout.map(|duration| {
                 let millis = duration.as_millis();
@@ -360,7 +362,7 @@ impl RuntimeCore {
         let global_value = self
             .js_runtime
             .execute_script("<eval_async>", code.clone())
-            .map_err(|err| err.to_string())?;
+            .map_err(|err| RuntimeError::javascript(JsExceptionDetails::from_js_error(*err)))?;
 
         let resolve_future = self.js_runtime.resolve(global_value);
         let poll_options = PollEventLoopOptions::default();
@@ -372,13 +374,13 @@ impl RuntimeCore {
                     .with_event_loop_promise(resolve_future, poll_options),
             )
             .await
-            .map_err(|_| format!("Evaluation timed out after {}ms", ms))?
-            .map_err(to_string)?
+            .map_err(|_| RuntimeError::timeout(format!("Evaluation timed out after {}ms", ms)))?
+            .map_err(RuntimeError::from)?
         } else {
             self.js_runtime
                 .with_event_loop_promise(resolve_future, poll_options)
                 .await
-                .map_err(to_string)?
+                .map_err(RuntimeError::from)?
         };
 
         let scope = &mut self.js_runtime.handle_scope();
@@ -386,24 +388,31 @@ impl RuntimeCore {
         Self::value_to_js_value(&self.fn_registry, &self.next_fn_id, scope, local)
     }
 
-    fn eval_module_sync(&mut self, specifier: &str) -> Result<JSValue, String> {
+    fn eval_module_sync(&mut self, specifier: &str) -> RuntimeResult<JSValue> {
         // Try to parse as absolute URL first, if it fails, resolve it as a bare specifier
         let module_specifier = if specifier.contains(':') || specifier.starts_with('/') {
             // Already a URL or absolute path
-            deno_core::ModuleSpecifier::parse(specifier)
-                .map_err(|e| format!("Invalid module specifier '{}': {}", specifier, e))?
+            deno_core::ModuleSpecifier::parse(specifier).map_err(|e| {
+                RuntimeError::internal(format!("Invalid module specifier '{}': {}", specifier, e))
+            })?
         } else {
             // Bare specifier - resolve relative to a synthetic base
             let base = deno_core::ModuleSpecifier::parse("jsrun://runtime/")
-                .map_err(|e| format!("Failed to create base URL: {}", e))?;
-            base.join(specifier)
-                .map_err(|e| format!("Failed to resolve module specifier '{}': {}", specifier, e))?
+                .map_err(|e| RuntimeError::internal(format!("Failed to create base URL: {}", e)))?;
+            base.join(specifier).map_err(|e| {
+                RuntimeError::internal(format!(
+                    "Failed to resolve module specifier '{}': {}",
+                    specifier, e
+                ))
+            })?
         };
 
         // Load the module
         let module_id =
             futures::executor::block_on(self.js_runtime.load_main_es_module(&module_specifier))
-                .map_err(|e| format!("Failed to load module '{}': {}", specifier, e))?;
+                .map_err(|e| {
+                    RuntimeError::internal(format!("Failed to load module '{}': {}", specifier, e))
+                })?;
 
         // Evaluate the module
         let receiver = self.js_runtime.mod_evaluate(module_id);
@@ -411,21 +420,23 @@ impl RuntimeCore {
         // Poll the runtime until the module evaluation completes
         let poll_options = PollEventLoopOptions::default();
         futures::executor::block_on(self.js_runtime.run_event_loop(poll_options))
-            .map_err(|e| e.to_string())?;
+            .map_err(RuntimeError::from)?;
 
         // Wait for the evaluation result - receiver returns Result<(), CoreError>
         let eval_result = futures::executor::block_on(receiver);
 
         // Check if evaluation succeeded
         if let Err(err) = eval_result {
-            return Err(format!("Module evaluation failed: {}", err));
+            return Err(RuntimeError::from(err));
         }
 
         // Get the module namespace - must call get_module_namespace before handle_scope
         let module_namespace = self
             .js_runtime
             .get_module_namespace(module_id)
-            .map_err(|e| format!("Failed to get module namespace: {}", e))?;
+            .map_err(|e| {
+                RuntimeError::internal(format!("Failed to get module namespace: {}", e))
+            })?;
         let scope = &mut self.js_runtime.handle_scope();
         let local = deno_core::v8::Local::new(scope, module_namespace);
         Self::value_to_js_value(&self.fn_registry, &self.next_fn_id, scope, local.into())
@@ -435,7 +446,7 @@ impl RuntimeCore {
         &mut self,
         specifier: String,
         timeout_ms: Option<u64>,
-    ) -> Result<JSValue, String> {
+    ) -> RuntimeResult<JSValue> {
         let timeout_ms = timeout_ms.or_else(|| {
             self.execution_timeout.map(|duration| {
                 let millis = duration.as_millis();
@@ -450,14 +461,19 @@ impl RuntimeCore {
         // Try to parse as absolute URL first, if it fails, resolve it as a bare specifier
         let module_specifier = if specifier.contains(':') || specifier.starts_with('/') {
             // Already a URL or absolute path
-            deno_core::ModuleSpecifier::parse(&specifier)
-                .map_err(|e| format!("Invalid module specifier '{}': {}", specifier, e))?
+            deno_core::ModuleSpecifier::parse(&specifier).map_err(|e| {
+                RuntimeError::internal(format!("Invalid module specifier '{}': {}", specifier, e))
+            })?
         } else {
             // Bare specifier - resolve relative to a synthetic base
             let base = deno_core::ModuleSpecifier::parse("jsrun://runtime/")
-                .map_err(|e| format!("Failed to create base URL: {}", e))?;
-            base.join(&specifier)
-                .map_err(|e| format!("Failed to resolve module specifier '{}': {}", specifier, e))?
+                .map_err(|e| RuntimeError::internal(format!("Failed to create base URL: {}", e)))?;
+            base.join(&specifier).map_err(|e| {
+                RuntimeError::internal(format!(
+                    "Failed to resolve module specifier '{}': {}",
+                    specifier, e
+                ))
+            })?
         };
 
         // Load the module
@@ -465,7 +481,9 @@ impl RuntimeCore {
             .js_runtime
             .load_main_es_module(&module_specifier)
             .await
-            .map_err(|e| format!("Failed to load module '{}': {}", specifier, e))?;
+            .map_err(|e| {
+                RuntimeError::internal(format!("Failed to load module '{}': {}", specifier, e))
+            })?;
 
         // Evaluate the module
         let receiver = self.js_runtime.mod_evaluate(module_id);
@@ -479,13 +497,15 @@ impl RuntimeCore {
                 self.js_runtime.run_event_loop(poll_options),
             )
             .await
-            .map_err(|_| format!("Module evaluation timed out after {}ms", ms))?
-            .map_err(|e| e.to_string())?
+            .map_err(|_| {
+                RuntimeError::timeout(format!("Module evaluation timed out after {}ms", ms))
+            })?
+            .map_err(RuntimeError::from)?
         } else {
             self.js_runtime
                 .run_event_loop(poll_options)
                 .await
-                .map_err(|e| e.to_string())?
+                .map_err(RuntimeError::from)?
         };
 
         // Wait for the evaluation result - receiver returns Result<(), CoreError>
@@ -493,14 +513,16 @@ impl RuntimeCore {
 
         // Check if evaluation succeeded
         if let Err(err) = eval_result {
-            return Err(format!("Module evaluation failed: {}", err));
+            return Err(RuntimeError::from(err));
         }
 
         // Get the module namespace - must call get_module_namespace before handle_scope
         let module_namespace = self
             .js_runtime
             .get_module_namespace(module_id)
-            .map_err(|e| format!("Failed to get module namespace: {}", e))?;
+            .map_err(|e| {
+                RuntimeError::internal(format!("Failed to get module namespace: {}", e))
+            })?;
         let scope = &mut self.js_runtime.handle_scope();
         let local = deno_core::v8::Local::new(scope, module_namespace);
         Self::value_to_js_value(&self.fn_registry, &self.next_fn_id, scope, local.into())
@@ -512,7 +534,7 @@ impl RuntimeCore {
         fn_id: u32,
         args: Vec<JSValue>,
         timeout_ms: Option<u64>,
-    ) -> Result<JSValue, String> {
+    ) -> RuntimeResult<JSValue> {
         // Determine timeout
         let timeout_ms = timeout_ms.or_else(|| {
             self.execution_timeout.map(|duration| {
@@ -528,37 +550,51 @@ impl RuntimeCore {
         // Look up function in registry and call it
         let result_global = {
             let scope = &mut self.js_runtime.handle_scope();
+            let mut try_catch = v8::TryCatch::new(scope);
 
             let (func, receiver) = {
                 let registry = self.fn_registry.borrow();
-                let stored = registry
-                    .get(&fn_id)
-                    .ok_or_else(|| format!("Function ID {} not found", fn_id))?;
-                let func = deno_core::v8::Local::new(scope, &stored.function);
+                let stored = registry.get(&fn_id).ok_or_else(|| {
+                    RuntimeError::internal(format!("Function ID {} not found", fn_id))
+                })?;
+                let func = deno_core::v8::Local::new(&mut try_catch, &stored.function);
                 let receiver = stored
                     .receiver
                     .as_ref()
-                    .map(|r| deno_core::v8::Local::new(scope, r));
+                    .map(|r| deno_core::v8::Local::new(&mut try_catch, r));
                 (func, receiver)
             };
 
             // Convert arguments from JSValue to v8::Value
             let mut v8_args = Vec::with_capacity(args.len());
             for arg in &args {
-                let v8_val = Self::js_value_to_v8(&self.fn_registry, scope, arg)?;
+                let v8_val = Self::js_value_to_v8(&self.fn_registry, &mut try_catch, arg)?;
                 v8_args.push(v8_val);
             }
 
-            let call_receiver =
-                receiver.unwrap_or_else(|| scope.get_current_context().global(scope).into());
+            let call_receiver = receiver.unwrap_or_else(|| {
+                try_catch
+                    .get_current_context()
+                    .global(&mut try_catch)
+                    .into()
+            });
 
             // Call the function
-            let result = func
-                .call(scope, call_receiver, &v8_args)
-                .ok_or_else(|| "Function call failed".to_string())?;
+            let result = match func.call(&mut try_catch, call_receiver, &v8_args) {
+                Some(value) => value,
+                None => {
+                    if let Some(exception) = try_catch.exception() {
+                        let js_error = JsError::from_v8_exception(&mut try_catch, exception);
+                        return Err(RuntimeError::javascript(JsExceptionDetails::from_js_error(
+                            *js_error,
+                        )));
+                    }
+                    return Err(RuntimeError::internal("Function call failed"));
+                }
+            };
 
             // Convert to Global for async resolution
-            deno_core::v8::Global::new(scope, result)
+            deno_core::v8::Global::new(&mut try_catch, result)
             // scope is dropped here
         };
 
@@ -573,13 +609,13 @@ impl RuntimeCore {
                     .with_event_loop_promise(resolve_future, poll_options),
             )
             .await
-            .map_err(|_| format!("Function call timed out after {}ms", ms))?
-            .map_err(to_string)?
+            .map_err(|_| RuntimeError::timeout(format!("Function call timed out after {}ms", ms)))?
+            .map_err(RuntimeError::from)?
         } else {
             self.js_runtime
                 .with_event_loop_promise(resolve_future, poll_options)
                 .await
-                .map_err(to_string)?
+                .map_err(RuntimeError::from)?
         };
 
         // Convert back to JSValue
@@ -589,11 +625,11 @@ impl RuntimeCore {
     }
 
     /// Remove a function from the registry, freeing its V8 global handle.
-    fn release_function(&mut self, fn_id: u32) -> Result<(), String> {
+    fn release_function(&mut self, fn_id: u32) -> RuntimeResult<()> {
         let mut registry = self.fn_registry.borrow_mut();
         registry
             .remove(&fn_id)
-            .ok_or_else(|| format!("Function ID {} not found", fn_id))?;
+            .ok_or_else(|| RuntimeError::internal(format!("Function ID {} not found", fn_id)))?;
         Ok(())
     }
 
@@ -603,7 +639,7 @@ impl RuntimeCore {
         next_fn_id: &Rc<RefCell<u32>>,
         scope: &mut deno_core::v8::HandleScope<'s>,
         value: deno_core::v8::Local<'s, deno_core::v8::Value>,
-    ) -> Result<JSValue, String> {
+    ) -> RuntimeResult<JSValue> {
         let mut seen = HashSet::new();
         let mut tracker = LimitTracker::new(MAX_JS_DEPTH, MAX_JS_BYTES);
         Self::value_to_js_value_internal(
@@ -621,7 +657,7 @@ impl RuntimeCore {
         registry: &Rc<RefCell<HashMap<u32, StoredFunction>>>,
         scope: &mut v8::HandleScope<'s>,
         value: &JSValue,
-    ) -> Result<v8::Local<'s, v8::Value>, String> {
+    ) -> RuntimeResult<v8::Local<'s, v8::Value>> {
         match value {
             JSValue::Undefined => Ok(v8::undefined(scope).into()),
             JSValue::Null => Ok(v8::null(scope).into()),
@@ -637,13 +673,13 @@ impl RuntimeCore {
                 }
                 let sign_bit = matches!(sign, Sign::Minus);
                 let v8_bigint = v8::BigInt::new_from_words(scope, sign_bit, &words)
-                    .ok_or_else(|| "Failed to create BigInt".to_string())?;
+                    .ok_or_else(|| RuntimeError::internal("Failed to create BigInt"))?;
                 Ok(v8_bigint.into())
             }
             JSValue::Float(f) => Ok(v8::Number::new(scope, *f).into()),
             JSValue::String(s) => {
                 let v8_str = v8::String::new(scope, s)
-                    .ok_or_else(|| "Failed to allocate string".to_string())?;
+                    .ok_or_else(|| RuntimeError::internal("Failed to allocate string"))?;
                 Ok(v8_str.into())
             }
             JSValue::Bytes(bytes) => {
@@ -652,7 +688,7 @@ impl RuntimeCore {
                 let buffer = v8::ArrayBuffer::with_backing_store(scope, &shared);
                 let len = bytes.len();
                 let typed = v8::Uint8Array::new(scope, buffer, 0, len)
-                    .ok_or_else(|| "Failed to create Uint8Array".to_string())?;
+                    .ok_or_else(|| RuntimeError::internal("Failed to create Uint8Array"))?;
                 Ok(typed.into())
             }
             JSValue::Array(items) => {
@@ -661,7 +697,7 @@ impl RuntimeCore {
                     let v8_value = Self::js_value_to_v8(registry, scope, item)?;
                     array
                         .set_index(scope, index as u32, v8_value)
-                        .ok_or_else(|| "Failed to set array element".to_string())?;
+                        .ok_or_else(|| RuntimeError::internal("Failed to set array element"))?;
                 }
                 Ok(array.into())
             }
@@ -676,25 +712,26 @@ impl RuntimeCore {
             JSValue::Object(map) => {
                 let object = v8::Object::new(scope);
                 for (key, val) in map.iter() {
-                    let key_str = v8::String::new(scope, key)
-                        .ok_or_else(|| format!("Failed to allocate key '{key}'"))?;
+                    let key_str = v8::String::new(scope, key).ok_or_else(|| {
+                        RuntimeError::internal(format!("Failed to allocate key '{key}'"))
+                    })?;
                     let v8_value = Self::js_value_to_v8(registry, scope, val)?;
-                    object
-                        .set(scope, key_str.into(), v8_value)
-                        .ok_or_else(|| format!("Failed to set property '{key}'"))?;
+                    object.set(scope, key_str.into(), v8_value).ok_or_else(|| {
+                        RuntimeError::internal(format!("Failed to set property '{key}'"))
+                    })?;
                 }
                 Ok(object.into())
             }
             JSValue::Date(epoch_ms) => {
                 let date = v8::Date::new(scope, *epoch_ms as f64)
-                    .ok_or_else(|| "Failed to create Date".to_string())?;
+                    .ok_or_else(|| RuntimeError::internal("Failed to create Date"))?;
                 Ok(date.into())
             }
             JSValue::Function { id } => {
                 let registry_ref = registry.borrow();
-                let stored = registry_ref
-                    .get(id)
-                    .ok_or_else(|| format!("Function ID {} not found in args", id))?;
+                let stored = registry_ref.get(id).ok_or_else(|| {
+                    RuntimeError::internal(format!("Function ID {} not found in args", id))
+                })?;
                 Ok(v8::Local::new(scope, &stored.function).into())
             }
         }
@@ -709,7 +746,7 @@ impl RuntimeCore {
         seen: &mut HashSet<i32>,
         tracker: &mut LimitTracker,
         receiver: Option<deno_core::v8::Global<deno_core::v8::Value>>,
-    ) -> Result<JSValue, String> {
+    ) -> RuntimeResult<JSValue> {
         tracker.enter()?;
 
         let result = if value.is_undefined() {
@@ -725,7 +762,7 @@ impl RuntimeCore {
             // Handle special numeric values (NaN, ±Infinity)
             let num_obj = value
                 .to_number(scope)
-                .ok_or_else(|| "Failed to convert value to number".to_string())?;
+                .ok_or_else(|| RuntimeError::internal("Failed to convert value to number"))?;
             let num_val = num_obj.value();
             if num_val.is_nan() || num_val.is_infinite() {
                 tracker.add_bytes(24)?;
@@ -745,7 +782,7 @@ impl RuntimeCore {
             }
         } else if value.is_big_int() {
             let bigint = deno_core::v8::Local::<deno_core::v8::BigInt>::try_from(value)
-                .map_err(|_| "Failed to cast to BigInt".to_string())?;
+                .map_err(|_| RuntimeError::internal("Failed to cast to BigInt"))?;
             let (int_value, lossless) = bigint.i64_value();
             if lossless {
                 tracker.add_bytes(20)?;
@@ -753,24 +790,24 @@ impl RuntimeCore {
             } else {
                 let string = bigint
                     .to_string(scope)
-                    .ok_or_else(|| "Failed to stringify BigInt".to_string())?
+                    .ok_or_else(|| RuntimeError::internal("Failed to stringify BigInt"))?
                     .to_rust_string_lossy(scope);
                 let parsed = BigInt::parse_bytes(string.as_bytes(), 10)
-                    .ok_or_else(|| "Failed to parse BigInt literal".to_string())?;
+                    .ok_or_else(|| RuntimeError::internal("Failed to parse BigInt literal"))?;
                 tracker.add_bytes(string.len())?;
                 Ok(JSValue::BigInt(parsed))
             }
         } else if value.is_string() {
             let string = value
                 .to_string(scope)
-                .ok_or_else(|| "Failed to convert string".to_string())?;
+                .ok_or_else(|| RuntimeError::internal("Failed to convert string"))?;
             let rust_str = string.to_rust_string_lossy(scope);
             tracker.add_bytes(rust_str.len())?;
             Ok(JSValue::String(rust_str))
         } else if value.is_function() {
             // Register function and return proxy ID
             let func = deno_core::v8::Local::<deno_core::v8::Function>::try_from(value)
-                .map_err(|_| "Failed to cast to function".to_string())?;
+                .map_err(|_| RuntimeError::internal("Failed to cast to function"))?;
 
             // Create a Global handle to keep the function alive
             let fn_handle = deno_core::v8::Global::new(scope, func);
@@ -793,10 +830,10 @@ impl RuntimeCore {
             tracker.add_bytes(8)?; // ID size
             Ok(JSValue::Function { id: fn_id })
         } else if value.is_symbol() {
-            Err("Cannot serialize V8 symbol".to_string())
+            Err(RuntimeError::internal("Cannot serialize V8 symbol"))
         } else if value.is_uint8_array() {
             let typed_array = deno_core::v8::Local::<deno_core::v8::Uint8Array>::try_from(value)
-                .map_err(|_| "Failed to cast to Uint8Array".to_string())?;
+                .map_err(|_| RuntimeError::internal("Failed to cast to Uint8Array"))?;
             let length = typed_array.byte_length();
             tracker.add_bytes(length)?;
             let mut buffer = vec![0u8; length];
@@ -805,7 +842,7 @@ impl RuntimeCore {
             Ok(JSValue::Bytes(buffer))
         } else if value.is_array_buffer() {
             let array_buffer = deno_core::v8::Local::<deno_core::v8::ArrayBuffer>::try_from(value)
-                .map_err(|_| "Failed to cast to ArrayBuffer".to_string())?;
+                .map_err(|_| RuntimeError::internal("Failed to cast to ArrayBuffer"))?;
             let length = array_buffer.byte_length();
             tracker.add_bytes(length)?;
             let mut buffer = vec![0u8; length];
@@ -824,23 +861,25 @@ impl RuntimeCore {
         } else if value.is_array() {
             // Check for circular reference using identity hash
             let obj = deno_core::v8::Local::<deno_core::v8::Object>::try_from(value)
-                .map_err(|_| "Failed to cast array to object".to_string())?;
+                .map_err(|_| RuntimeError::internal("Failed to cast array to object"))?;
             let hash = obj.get_identity_hash().get();
 
             if !seen.insert(hash) {
-                return Err("Cannot serialize circular reference".to_string());
+                return Err(RuntimeError::internal(
+                    "Cannot serialize circular reference",
+                ));
             }
 
             let array = deno_core::v8::Local::<deno_core::v8::Array>::try_from(value)
-                .map_err(|_| "Failed to cast to array".to_string())?;
+                .map_err(|_| RuntimeError::internal("Failed to cast to array"))?;
             let len = array.length() as usize;
 
             let mut items = Vec::with_capacity(len);
             for i in 0..len {
                 let idx = i as u32;
-                let item = array
-                    .get_index(scope, idx)
-                    .ok_or_else(|| format!("Failed to get array index {}", i))?;
+                let item = array.get_index(scope, idx).ok_or_else(|| {
+                    RuntimeError::internal(format!("Failed to get array index {}", i))
+                })?;
                 items.push(Self::value_to_js_value_internal(
                     fn_registry,
                     next_fn_id,
@@ -856,15 +895,17 @@ impl RuntimeCore {
             Ok(JSValue::Array(items))
         } else if value.is_set() {
             let obj = deno_core::v8::Local::<deno_core::v8::Object>::try_from(value)
-                .map_err(|_| "Failed to cast set to object".to_string())?;
+                .map_err(|_| RuntimeError::internal("Failed to cast set to object"))?;
             let hash = obj.get_identity_hash().get();
 
             if !seen.insert(hash) {
-                return Err("Cannot serialize circular reference".to_string());
+                return Err(RuntimeError::internal(
+                    "Cannot serialize circular reference",
+                ));
             }
 
             let set = deno_core::v8::Local::<deno_core::v8::Set>::try_from(value)
-                .map_err(|_| "Failed to cast to Set".to_string())?;
+                .map_err(|_| RuntimeError::internal("Failed to cast to Set"))?;
             let entries = set.as_array(scope);
             let len = entries.length() as usize;
 
@@ -875,7 +916,7 @@ impl RuntimeCore {
             for index in 0..len {
                 let element = entries
                     .get_index(scope, index as u32)
-                    .ok_or_else(|| "Failed to get Set entry".to_string())?;
+                    .ok_or_else(|| RuntimeError::internal("Failed to get Set entry"))?;
                 values.push(Self::value_to_js_value_internal(
                     fn_registry,
                     next_fn_id,
@@ -891,41 +932,43 @@ impl RuntimeCore {
             Ok(JSValue::Set(values))
         } else if value.is_date() {
             let date = deno_core::v8::Local::<deno_core::v8::Date>::try_from(value)
-                .map_err(|_| "Failed to cast to Date".to_string())?;
+                .map_err(|_| RuntimeError::internal("Failed to cast to Date"))?;
             let epoch_ms = date.value_of();
             if !epoch_ms.is_finite() || epoch_ms < i64::MIN as f64 || epoch_ms > i64::MAX as f64 {
-                return Err("Date value out of range".to_string());
+                return Err(RuntimeError::internal("Date value out of range"));
             }
             tracker.add_bytes(16)?;
             Ok(JSValue::Date(epoch_ms.round() as i64))
         } else if value.is_object() {
             // Check for circular reference using identity hash
             let obj = deno_core::v8::Local::<deno_core::v8::Object>::try_from(value)
-                .map_err(|_| "Failed to cast to object".to_string())?;
+                .map_err(|_| RuntimeError::internal("Failed to cast to object"))?;
             let hash = obj.get_identity_hash().get();
 
             if !seen.insert(hash) {
-                return Err("Cannot serialize circular reference".to_string());
+                return Err(RuntimeError::internal(
+                    "Cannot serialize circular reference",
+                ));
             }
 
             // Get property names
             let prop_names = obj
                 .get_own_property_names(scope, deno_core::v8::GetPropertyNamesArgs::default())
-                .ok_or_else(|| "Failed to get property names".to_string())?;
+                .ok_or_else(|| RuntimeError::internal("Failed to get property names"))?;
 
             let mut map = IndexMap::new();
             for i in 0..prop_names.length() {
                 let key = prop_names
                     .get_index(scope, i)
-                    .ok_or_else(|| "Failed to get property name".to_string())?;
+                    .ok_or_else(|| RuntimeError::internal("Failed to get property name"))?;
                 let key_str = key
                     .to_string(scope)
-                    .ok_or_else(|| "Failed to convert key to string".to_string())?
+                    .ok_or_else(|| RuntimeError::internal("Failed to convert key to string"))?
                     .to_rust_string_lossy(scope);
 
-                let val = obj
-                    .get(scope, key)
-                    .ok_or_else(|| format!("Failed to get property '{}'", key_str))?;
+                let val = obj.get(scope, key).ok_or_else(|| {
+                    RuntimeError::internal(format!("Failed to get property '{}'", key_str))
+                })?;
 
                 // If the value is a function, capture the object as the receiver for 'this' binding
                 let receiver_for_val = if val.is_function() {
@@ -956,7 +999,7 @@ impl RuntimeCore {
             // Fallback: convert to string
             let string = value
                 .to_string(scope)
-                .ok_or_else(|| "Failed to convert value to string".to_string())?;
+                .ok_or_else(|| RuntimeError::internal("Failed to convert value to string"))?;
             let rust_str = string.to_rust_string_lossy(scope);
             tracker.add_bytes(rust_str.len())?;
             Ok(JSValue::String(rust_str))
@@ -965,8 +1008,4 @@ impl RuntimeCore {
         tracker.exit();
         result
     }
-}
-
-fn to_string(error: CoreError) -> String {
-    error.to_string()
 }

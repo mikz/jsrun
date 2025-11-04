@@ -6,6 +6,7 @@
 
 pub mod config;
 pub mod conversion;
+pub mod error;
 pub mod handle;
 pub mod js_value;
 pub mod loader;
@@ -15,6 +16,8 @@ pub mod runner;
 
 #[allow(unused_imports)] // Re-exported for downstream crates.
 pub use config::RuntimeConfig;
+#[allow(unused_imports)]
+pub use error::{JsExceptionDetails, JsFrameSummary, RuntimeError, RuntimeResult};
 #[allow(unused_imports)] // Re-exported for downstream crates.
 pub use handle::RuntimeHandle;
 

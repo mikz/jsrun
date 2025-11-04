@@ -3,9 +3,20 @@ Type stubs for the jsrun Python extension module.
 """
 
 import types
-from typing import Any, Awaitable, Callable, Mapping, Optional, Self, TypeVar, overload
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Mapping,
+    Optional,
+    Self,
+    TypeVar,
+    TypedDict,
+    overload,
+)
 
 __all__ = [
+    "JavaScriptError",
     "Runtime",
     "RuntimeConfig",
     "JsFunction",
@@ -130,6 +141,46 @@ class JsUndefined:
     def __str__(self) -> str: ...
 
 undefined: JsUndefined
+
+class JsFrame(TypedDict, total=False):
+    """Structured stack frame information captured from V8."""
+
+    function_name: str
+    file_name: str
+    line_number: int
+    column_number: int
+
+class JavaScriptError(Exception):
+    """Raised when JavaScript code running in the runtime throws an exception.
+
+    The runtime surfaces JavaScript exceptions as ``JavaScriptError`` instances
+    that preserve structured metadata from V8, giving callers access to the
+    original error class, message, stack trace, and individual frames.
+
+    Attributes:
+        name: JavaScript error class name (e.g. ``"TypeError"``). ``None`` when
+            non-Error values are thrown.
+        message: Error message string when available.
+        stack: V8 formatted stack trace string if provided.
+        frames: Parsed stack frames populated with optional ``function_name``,
+            ``file_name``, ``line_number``, and ``column_number`` keys.
+
+    Example:
+        >>> try:
+        ...     runtime.eval("throw new TypeError('Invalid value')")
+        ... except JavaScriptError as err:
+        ...     print(err.name, err.message)
+        ...     for frame in err.frames:
+        ...         print(frame.get("function_name"), frame.get("file_name"))
+    """
+
+    name: str | None
+    message: str | None
+    stack: str | None
+    frames: list[JsFrame]
+
+    def __str__(self) -> str: ...
+    def __repr__(self) -> str: ...
 
 class Runtime:
     """

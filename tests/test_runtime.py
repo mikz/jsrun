@@ -11,7 +11,7 @@ import time
 from datetime import datetime, timezone
 
 import pytest
-from jsrun import JsUndefined, Runtime, undefined
+from jsrun import JavaScriptError, JsUndefined, Runtime, undefined
 
 
 class TestRuntimeBasics:
@@ -48,6 +48,56 @@ class TestRuntimeBasics:
         try:
             result = runtime.eval("Math.max(10, 20, 30)")
             assert result == 30
+        finally:
+            runtime.close()
+
+    def test_runtime_eval_javascript_error_metadata(self):
+        """JavaScript exceptions should raise JavaScriptError with metadata."""
+        runtime = Runtime()
+        try:
+            with pytest.raises(JavaScriptError) as exc_info:
+                runtime.eval(
+                    """
+                    (() => {
+                        const error = new TypeError("boom");
+                        error.custom = 123;
+                        throw error;
+                    })()
+                    """
+                )
+            js_error = exc_info.value
+            assert js_error.name == "TypeError"
+            assert "boom" in js_error.message
+            assert js_error.stack is not None
+            assert "<eval>" in js_error.stack
+            assert "TypeError" in str(js_error)
+        finally:
+            runtime.close()
+
+    def test_runtime_eval_javascript_error_frames(self):
+        """JavaScript exceptions should capture stack frame information."""
+        runtime = Runtime()
+        try:
+            with pytest.raises(JavaScriptError) as exc_info:
+                runtime.eval(
+                    """
+                    function causeError() {
+                        throw new TypeError("boom");
+                    }
+                    causeError()
+                    """
+                )
+            js_error = exc_info.value
+            assert js_error.name == "TypeError"
+            assert "boom" in js_error.message
+
+            # Validate frame structure
+            assert len(js_error.frames) > 0
+            frame = js_error.frames[0]
+            assert "function_name" in frame
+            assert frame.get("function_name") == "causeError"
+            assert "file_name" in frame
+            assert "line_number" in frame
         finally:
             runtime.close()
 
@@ -484,21 +534,25 @@ class TestRuntimeAsync:
     async def test_eval_async_promise_rejection(self):
         """Test async eval with rejected promise."""
         with Runtime() as runtime:
-            with pytest.raises(RuntimeError) as exc_info:
+            with pytest.raises(JavaScriptError) as exc_info:
                 await runtime.eval_async("Promise.reject(new Error('test error'))")
-            message = str(exc_info.value)
-            assert "Evaluation failed" in message
-            assert "test error" in message
+            js_error = exc_info.value
+            assert js_error.name == "Error"
+            assert "test error" in js_error.message
+            assert js_error.stack is not None
+            assert "test error" in js_error.stack
 
     @pytest.mark.asyncio
     async def test_eval_async_promise_rejection_value(self):
         """Test async eval with rejected promise (non-Error value)."""
         with Runtime() as runtime:
-            with pytest.raises(RuntimeError) as exc_info:
+            with pytest.raises(JavaScriptError) as exc_info:
                 await runtime.eval_async("Promise.reject('custom error')")
-            message = str(exc_info.value)
-            assert "Evaluation failed" in message
-            assert "custom error" in message
+            js_error = exc_info.value
+            assert js_error.name is None or js_error.name == "Error"
+            assert "custom error" in js_error.message
+            if js_error.stack:
+                assert "custom error" in js_error.stack
 
 
 class TestRuntimeTimeout:
@@ -618,8 +672,11 @@ class TestRuntimeAsyncErrors:
     async def test_eval_async_syntax_error(self):
         """Test that syntax errors are properly reported in async eval."""
         with Runtime() as runtime:
-            with pytest.raises(RuntimeError, match="failed"):
+            with pytest.raises(JavaScriptError) as exc_info:
                 await runtime.eval_async("this is not valid javascript {{{")
+            js_error = exc_info.value
+            assert js_error.name == "SyntaxError"
+            assert js_error.stack is not None
 
     @pytest.mark.asyncio
     async def test_eval_async_runtime_error(self):
@@ -630,11 +687,12 @@ class TestRuntimeAsyncErrors:
                     reject(new Error('Runtime error in promise'));
                 })
             """
-            with pytest.raises(RuntimeError) as exc_info:
+            with pytest.raises(JavaScriptError) as exc_info:
                 await runtime.eval_async(code)
-            message = str(exc_info.value)
-            assert "Evaluation failed" in message
-            assert "Runtime error in promise" in message
+            js_error = exc_info.value
+            assert js_error.name == "Error"
+            assert "Runtime error in promise" in js_error.message
+            assert js_error.stack is not None
 
     @pytest.mark.asyncio
     async def test_eval_async_after_close(self):
@@ -886,9 +944,11 @@ class TestRuntimeNativeTypes:
     def test_eval_function_raises_error(self):
         """Test that functions raise appropriate errors."""
         with Runtime() as runtime:
-            with pytest.raises(RuntimeError) as exc_info:
+            with pytest.raises(JavaScriptError) as exc_info:
                 runtime.eval("function() { return 42; }")
-            assert "function" in str(exc_info.value).lower()
+            js_error = exc_info.value
+            assert js_error.name == "SyntaxError"
+            assert "function" in js_error.message.lower()
 
     def test_eval_circular_reference_raises_error(self):
         """Test that circular references raise appropriate errors."""
@@ -969,7 +1029,7 @@ class TestRuntimeOpsNativeTypes:
 
         with Runtime() as runtime:
             runtime.register_op("makeCircularList", make_circular_list, mode="sync")
-            with pytest.raises(RuntimeError) as exc_info:
+            with pytest.raises(JavaScriptError) as exc_info:
                 runtime.eval("__host_op_sync__(0)")
             message = str(exc_info.value).lower()
             assert "circular" in message and "list" in message
@@ -984,7 +1044,7 @@ class TestRuntimeOpsNativeTypes:
 
         with Runtime() as runtime:
             runtime.register_op("makeCircularDict", make_circular_dict, mode="sync")
-            with pytest.raises(RuntimeError) as exc_info:
+            with pytest.raises(JavaScriptError) as exc_info:
                 runtime.eval("__host_op_sync__(0)")
             message = str(exc_info.value).lower()
             assert "circular" in message and "dict" in message
@@ -998,7 +1058,7 @@ class TestRuntimeOpsNativeTypes:
 
         with Runtime() as runtime:
             runtime.register_op("makeLargeList", make_large_list, mode="sync")
-            with pytest.raises(RuntimeError) as exc_info:
+            with pytest.raises(JavaScriptError) as exc_info:
                 runtime.eval("__host_op_sync__(0)")
             message = str(exc_info.value).lower()
             assert "size" in message or "limit" in message
