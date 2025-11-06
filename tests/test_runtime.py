@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 import pytest
 from jsrun import (
     JavaScriptError,
+    JsFunction,
     JsUndefined,
     Runtime,
     RuntimeConfig,
@@ -717,6 +718,14 @@ class TestRuntimeAsync:
             """
             result = await runtime.eval_async(code)
             assert result == 25
+
+    @pytest.mark.asyncio
+    async def test_eval_async_returns_js_function(self):
+        """Ensure eval_async can round-trip JavaScript functions safely."""
+        with Runtime() as runtime:
+            js_func = await runtime.eval_async("Promise.resolve((value) => value + 5)")
+            assert isinstance(js_func, JsFunction)
+            assert await js_func(37) == 42
 
     @pytest.mark.asyncio
     async def test_eval_async_promise_rejection(self):
