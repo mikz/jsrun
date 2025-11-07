@@ -6,6 +6,10 @@
 
 use crate::runtime::config::RuntimeConfig;
 use crate::runtime::error::{JsExceptionDetails, RuntimeError, RuntimeResult};
+use crate::runtime::inspector::{
+    InspectorConnectionState, InspectorMetadata, InspectorRegistration,
+    InspectorRegistrationParams, InspectorServer,
+};
 use crate::runtime::js_value::{JSValue, LimitTracker, MAX_JS_BYTES, MAX_JS_DEPTH};
 use crate::runtime::loader::PythonModuleLoader;
 use crate::runtime::ops::{python_extension, PythonOpMode, PythonOpRegistry};
@@ -34,9 +38,15 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
-type InitSignalChannel = (
-    StdSender<RuntimeResult<TerminationController>>,
-    StdReceiver<RuntimeResult<TerminationController>>,
+type RuntimeInitResult = RuntimeResult<(
+    TerminationController,
+    Option<(InspectorMetadata, InspectorConnectionState)>,
+)>;
+type InitSignalChannel = (StdSender<RuntimeInitResult>, StdReceiver<RuntimeInitResult>);
+type SpawnRuntimeResult = (
+    mpsc::UnboundedSender<RuntimeCommand>,
+    TerminationController,
+    Option<(InspectorMetadata, InspectorConnectionState)>,
 );
 
 /// Stored function with optional receiver for 'this' binding
@@ -174,9 +184,7 @@ pub enum RuntimeCommand {
     },
 }
 
-pub fn spawn_runtime_thread(
-    config: RuntimeConfig,
-) -> RuntimeResult<(mpsc::UnboundedSender<RuntimeCommand>, TerminationController)> {
+pub fn spawn_runtime_thread(config: RuntimeConfig) -> RuntimeResult<SpawnRuntimeResult> {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<RuntimeCommand>();
     let (init_tx, init_rx): InitSignalChannel = std::sync::mpsc::channel();
 
@@ -191,7 +199,12 @@ pub fn spawn_runtime_thread(
             let mut core = match RuntimeCore::new(config) {
                 Ok(core) => {
                     let termination = core.termination_controller();
-                    let _ = init_tx.send(Ok(termination));
+                    let inspector_info =
+                        match (core.inspector_metadata(), core.inspector_connection_state()) {
+                            (Some(meta), Some(state)) => Some((meta, state)),
+                            _ => None,
+                        };
+                    let _ = init_tx.send(Ok((termination, inspector_info)));
                     core
                 }
                 Err(err) => {
@@ -207,11 +220,30 @@ pub fn spawn_runtime_thread(
         .map_err(|e| RuntimeError::internal(format!("Failed to spawn runtime thread: {}", e)))?;
 
     match init_rx.recv() {
-        Ok(Ok(termination)) => Ok((cmd_tx, termination)),
+        Ok(Ok((termination, inspector_info))) => Ok((cmd_tx, termination, inspector_info)),
         Ok(Err(err)) => Err(err),
         Err(_) => Err(RuntimeError::internal(
             "Runtime thread initialization failed",
         )),
+    }
+}
+
+struct InspectorRuntimeState {
+    _server: InspectorServer,
+    registration: InspectorRegistration,
+    wait_for_connection: bool,
+    break_on_next_statement: bool,
+    has_waited: bool,
+    connection_state: InspectorConnectionState,
+}
+
+impl InspectorRuntimeState {
+    fn metadata(&self) -> InspectorMetadata {
+        self.registration.metadata().clone()
+    }
+
+    fn connection_state(&self) -> InspectorConnectionState {
+        self.connection_state.clone()
     }
 }
 
@@ -226,6 +258,7 @@ struct RuntimeCore {
     stats_state: RuntimeStatsState,
     termination: TerminationController,
     terminated: bool,
+    inspector_state: Option<InspectorRuntimeState>,
 }
 
 impl RuntimeCore {
@@ -240,6 +273,7 @@ impl RuntimeCore {
             execution_timeout,
             bootstrap_script,
             enable_console,
+            inspector,
         } = config;
 
         if initial_heap_size.is_some() && max_heap_size.is_none() {
@@ -265,12 +299,19 @@ impl RuntimeCore {
             (None, _) => None,
         };
 
+        let inspector_enabled = inspector.is_some();
         let mut js_runtime = JsRuntime::new(RuntimeOptions {
             extensions: vec![extension],
             create_params,
             module_loader: Some(module_loader.clone()),
+            inspector: inspector_enabled,
+            is_main: true,
             ..Default::default()
         });
+
+        if inspector_enabled {
+            js_runtime.maybe_init_inspector();
+        }
 
         // Disable console if enable_console is set to false, since Deno's bootstrap script enables console by default
         if enable_console == Some(false) {
@@ -308,6 +349,42 @@ impl RuntimeCore {
             TerminationController::new(handle)
         };
 
+        let inspector_state = match inspector {
+            Some(inspector_cfg) => {
+                let wait_for_connection = inspector_cfg.wait_for_connection;
+                let break_on_next_statement = inspector_cfg.break_on_next_statement;
+                let connection_state = InspectorConnectionState::default();
+                let server =
+                    InspectorServer::bind(inspector_cfg.socket_addr(), "jsrun").map_err(|err| {
+                        RuntimeError::internal(format!("Failed to start inspector server: {err}"))
+                    })?;
+
+                let registration = server
+                    .register_runtime(
+                        js_runtime.inspector(),
+                        InspectorRegistrationParams {
+                            target_url: inspector_cfg.target_url.clone(),
+                            display_name: inspector_cfg.display_name.clone(),
+                            wait_for_connection,
+                        },
+                        connection_state.clone(),
+                    )
+                    .map_err(|err| {
+                        RuntimeError::internal(format!("Failed to register inspector: {err}"))
+                    })?;
+
+                Some(InspectorRuntimeState {
+                    _server: server,
+                    registration,
+                    wait_for_connection,
+                    break_on_next_statement,
+                    has_waited: false,
+                    connection_state,
+                })
+            }
+            None => None,
+        };
+
         Ok(Self {
             js_runtime,
             registry,
@@ -319,7 +396,37 @@ impl RuntimeCore {
             stats_state: RuntimeStatsState::default(),
             termination,
             terminated: false,
+            inspector_state,
         })
+    }
+
+    fn inspector_metadata(&self) -> Option<InspectorMetadata> {
+        self.inspector_state.as_ref().map(|state| state.metadata())
+    }
+
+    fn inspector_connection_state(&self) -> Option<InspectorConnectionState> {
+        self.inspector_state
+            .as_ref()
+            .map(|state| state.connection_state())
+    }
+
+    fn ensure_inspector_ready(&mut self) -> RuntimeResult<()> {
+        if let Some(state) = self.inspector_state.as_mut() {
+            if state.has_waited {
+                return Ok(());
+            }
+            if state.wait_for_connection || state.break_on_next_statement {
+                let inspector = self.js_runtime.inspector();
+                let mut inspector_ref = inspector.borrow_mut();
+                if state.break_on_next_statement {
+                    inspector_ref.wait_for_session_and_break_on_next_statement();
+                } else if state.wait_for_connection {
+                    inspector_ref.wait_for_session();
+                }
+            }
+            state.has_waited = true;
+        }
+        Ok(())
     }
 
     fn termination_controller(&self) -> TerminationController {
@@ -333,6 +440,10 @@ impl RuntimeCore {
                 RuntimeCommand::Eval { code, responder } => {
                     if self.should_reject_new_work() {
                         let _ = responder.send(Err(RuntimeError::terminated()));
+                        continue;
+                    }
+                    if let Err(err) = self.ensure_inspector_ready() {
+                        let _ = responder.send(Err(err));
                         continue;
                     }
                     let watchdog = match self.start_sync_watchdog() {
@@ -354,6 +465,10 @@ impl RuntimeCore {
                 } => {
                     if self.should_reject_new_work() {
                         let _ = responder.send(Err(RuntimeError::terminated()));
+                        continue;
+                    }
+                    if let Err(err) = self.ensure_inspector_ready() {
+                        let _ = responder.send(Err(err));
                         continue;
                     }
                     if let Some(ref locals) = task_locals {
@@ -422,6 +537,10 @@ impl RuntimeCore {
                         let _ = responder.send(Err(RuntimeError::terminated()));
                         continue;
                     }
+                    if let Err(err) = self.ensure_inspector_ready() {
+                        let _ = responder.send(Err(err));
+                        continue;
+                    }
                     let watchdog = match self.start_sync_watchdog() {
                         Ok(watchdog) => watchdog,
                         Err(err) => {
@@ -444,6 +563,10 @@ impl RuntimeCore {
                         let _ = responder.send(Err(RuntimeError::terminated()));
                         continue;
                     }
+                    if let Err(err) = self.ensure_inspector_ready() {
+                        let _ = responder.send(Err(err));
+                        continue;
+                    }
                     if let Some(ref locals) = task_locals {
                         self.task_locals = Some(locals.clone());
                         self.module_loader.set_task_locals(locals.clone());
@@ -464,6 +587,10 @@ impl RuntimeCore {
                 } => {
                     if self.should_reject_new_work() {
                         let _ = responder.send(Err(RuntimeError::terminated()));
+                        continue;
+                    }
+                    if let Err(err) = self.ensure_inspector_ready() {
+                        let _ = responder.send(Err(err));
                         continue;
                     }
                     if let Some(ref locals) = task_locals {

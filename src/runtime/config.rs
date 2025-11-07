@@ -5,7 +5,154 @@
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use std::net::SocketAddr;
 use std::time::Duration;
+
+fn parse_socket_addr(host: &str, port: u16) -> PyResult<SocketAddr> {
+    if host.trim().is_empty() {
+        return Err(PyValueError::new_err("Inspector host cannot be empty"));
+    }
+    if port == 0 {
+        return Err(PyValueError::new_err(
+            "Inspector port must be a positive integer",
+        ));
+    }
+
+    let candidate = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+
+    candidate.parse::<SocketAddr>().map_err(|err| {
+        PyValueError::new_err(format!("Invalid inspector address '{candidate}': {err}"))
+    })
+}
+
+/// Inspector configuration shared between Rust and Python.
+#[pyclass(module = "jsrun")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InspectorConfig {
+    pub address: SocketAddr,
+    pub wait_for_connection: bool,
+    pub break_on_next_statement: bool,
+    pub target_url: Option<String>,
+    pub display_name: Option<String>,
+}
+
+impl Default for InspectorConfig {
+    fn default() -> Self {
+        Self {
+            address: SocketAddr::from(([127, 0, 0, 1], 9229)),
+            wait_for_connection: false,
+            break_on_next_statement: false,
+            target_url: None,
+            display_name: None,
+        }
+    }
+}
+
+impl InspectorConfig {
+    pub fn socket_addr(&self) -> SocketAddr {
+        self.address
+    }
+}
+
+#[pymethods]
+impl InspectorConfig {
+    #[new]
+    #[pyo3(signature = (
+        host = "127.0.0.1",
+        port = 9229,
+        wait_for_connection = false,
+        break_on_next_statement = false,
+        target_url = None,
+        display_name = None,
+    ))]
+    fn new(
+        host: &str,
+        port: u16,
+        wait_for_connection: bool,
+        break_on_next_statement: bool,
+        target_url: Option<String>,
+        display_name: Option<String>,
+    ) -> PyResult<Self> {
+        let address = parse_socket_addr(host, port)?;
+        Ok(Self {
+            address,
+            wait_for_connection,
+            break_on_next_statement,
+            target_url,
+            display_name,
+        })
+    }
+
+    #[getter]
+    fn host(&self) -> String {
+        self.address.ip().to_string()
+    }
+
+    #[getter]
+    fn port(&self) -> u16 {
+        self.address.port()
+    }
+
+    #[getter]
+    fn wait_for_connection(&self) -> bool {
+        self.wait_for_connection
+    }
+
+    #[setter]
+    fn set_wait_for_connection(&mut self, wait: bool) {
+        self.wait_for_connection = wait;
+    }
+
+    #[getter]
+    fn break_on_next_statement(&self) -> bool {
+        self.break_on_next_statement
+    }
+
+    #[setter]
+    fn set_break_on_next_statement(&mut self, should_break: bool) {
+        self.break_on_next_statement = should_break;
+    }
+
+    #[getter]
+    fn target_url(&self) -> Option<String> {
+        self.target_url.clone()
+    }
+
+    #[setter]
+    fn set_target_url(&mut self, url: Option<String>) {
+        self.target_url = url;
+    }
+
+    #[getter]
+    fn display_name(&self) -> Option<String> {
+        self.display_name.clone()
+    }
+
+    #[setter]
+    fn set_display_name(&mut self, name: Option<String>) {
+        self.display_name = name;
+    }
+
+    fn endpoint(&self) -> String {
+        self.address.to_string()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "InspectorConfig(host={:?}, port={}, wait_for_connection={}, break_on_next_statement={}, target_url={:?}, display_name={:?})",
+            self.host(),
+            self.port(),
+            self.wait_for_connection,
+            self.break_on_next_statement,
+            self.target_url,
+            self.display_name,
+        )
+    }
+}
 
 /// Runtime configuration for a single JavaScript isolate.
 #[pyclass(module = "jsrun")]
@@ -26,6 +173,9 @@ pub struct RuntimeConfig {
 
     /// Enable console output (default: true)
     pub enable_console: Option<bool>,
+
+    /// Optional inspector configuration.
+    pub inspector: Option<InspectorConfig>,
 }
 
 impl Default for RuntimeConfig {
@@ -36,6 +186,7 @@ impl Default for RuntimeConfig {
             execution_timeout: None,
             bootstrap_script: None,
             enable_console: Some(true),
+            inspector: None,
         }
     }
 }
@@ -50,6 +201,7 @@ impl RuntimeConfig {
         bootstrap = None,
         timeout = None,
         enable_console = Some(true),
+        inspector = None,
     ))]
     fn new(
         max_heap_size: Option<usize>,
@@ -57,8 +209,12 @@ impl RuntimeConfig {
         bootstrap: Option<String>,
         timeout: Option<&Bound<'_, PyAny>>,
         enable_console: Option<bool>,
+        inspector: Option<InspectorConfig>,
     ) -> PyResult<Self> {
-        let mut config = RuntimeConfig::default();
+        let mut config = RuntimeConfig {
+            inspector,
+            ..RuntimeConfig::default()
+        };
 
         // Set max heap size if provided
         if let Some(size) = max_heap_size {
@@ -184,6 +340,18 @@ impl RuntimeConfig {
         self.enable_console
     }
 
+    /// Get inspector configuration if enabled.
+    #[getter]
+    fn inspector(&self) -> Option<InspectorConfig> {
+        self.inspector.clone()
+    }
+
+    /// Set inspector configuration.
+    #[setter]
+    fn set_inspector(&mut self, inspector: Option<InspectorConfig>) {
+        self.inspector = inspector;
+    }
+
     fn __repr__(&self) -> String {
         format!("RuntimeConfig({:?})", self)
     }
@@ -201,6 +369,7 @@ mod tests {
         assert!(config.execution_timeout.is_none());
         assert!(config.bootstrap_script.is_none());
         assert_eq!(config.enable_console, Some(true));
+        assert!(config.inspector.is_none());
     }
 
     #[allow(clippy::field_reassign_with_default)]
@@ -212,5 +381,34 @@ mod tests {
 
         assert_eq!(config.max_heap_size, Some(100 * 1024 * 1024));
         assert_eq!(config.execution_timeout, Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn test_inspector_config_defaults() {
+        let inspector = InspectorConfig::default();
+        assert_eq!(inspector.host(), "127.0.0.1");
+        assert_eq!(inspector.port(), 9229);
+        assert!(!inspector.wait_for_connection);
+        assert!(!inspector.break_on_next_statement);
+        assert!(inspector.target_url().is_none());
+        assert!(inspector.display_name().is_none());
+    }
+
+    #[test]
+    fn test_runtime_config_with_inspector() {
+        let mut inspector = InspectorConfig::default();
+        inspector.set_wait_for_connection(true);
+        inspector.set_break_on_next_statement(true);
+        inspector.set_target_url(Some("module:main".to_string()));
+
+        let config = RuntimeConfig {
+            inspector: Some(inspector.clone()),
+            ..RuntimeConfig::default()
+        };
+
+        let configured = config.inspector().expect("inspector config");
+        assert!(configured.wait_for_connection());
+        assert!(configured.break_on_next_statement());
+        assert_eq!(configured.target_url(), Some("module:main".to_string()));
     }
 }

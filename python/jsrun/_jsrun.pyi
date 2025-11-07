@@ -17,6 +17,8 @@ from typing import (
 )
 
 __all__ = [
+    "InspectorConfig",
+    "InspectorEndpoints",
     "JavaScriptError",
     "Runtime",
     "RuntimeConfig",
@@ -30,6 +32,60 @@ __all__ = [
 F = TypeVar("F", bound=Callable[..., Any])
 
 # Core runtime types
+
+class InspectorConfig:
+    """
+    Configuration for enabling the Chrome DevTools inspector.
+    """
+
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 9229,
+        *,
+        wait_for_connection: bool = False,
+        break_on_next_statement: bool = False,
+        target_url: Optional[str] = None,
+        display_name: Optional[str] = None,
+    ) -> None:
+        """
+        Create a new inspector configuration.
+
+        Args:
+            host: Host interface to bind (defaults to ``127.0.0.1``)
+            port: TCP port for the DevTools server
+            wait_for_connection: Block execution until a debugger connects
+            break_on_next_statement: Pause on the first statement after a debugger attaches
+            target_url: Optional string reported to DevTools for the inspected target
+            display_name: Optional display title surfaced in ``chrome://inspect``
+        """
+        ...
+
+    @property
+    def host(self) -> str: ...
+    @property
+    def port(self) -> int: ...
+    @property
+    def wait_for_connection(self) -> bool: ...
+    @wait_for_connection.setter
+    def wait_for_connection(self, enabled: bool) -> None: ...
+    @property
+    def break_on_next_statement(self) -> bool: ...
+    @break_on_next_statement.setter
+    def break_on_next_statement(self, enabled: bool) -> None: ...
+    @property
+    def target_url(self) -> Optional[str]: ...
+    @target_url.setter
+    def target_url(self, value: Optional[str]) -> None: ...
+    @property
+    def display_name(self) -> Optional[str]: ...
+    @display_name.setter
+    def display_name(self, value: Optional[str]) -> None: ...
+    def endpoint(self) -> str:
+        """Return the ``host:port`` pair that DevTools should connect to."""
+        ...
+
+    def __repr__(self) -> str: ...
 
 class RuntimeConfig:
     """
@@ -45,6 +101,8 @@ class RuntimeConfig:
         initial_heap_size: Optional[int] = None,
         bootstrap: Optional[str] = None,
         timeout: Optional[float | int] = None,
+        enable_console: Optional[bool] = True,
+        inspector: Optional[InspectorConfig] = None,
     ) -> None:
         """
         Create a new runtime configuration.
@@ -54,6 +112,8 @@ class RuntimeConfig:
             initial_heap_size: Initial heap size in bytes
             bootstrap: JavaScript source code to execute on startup
             timeout: Execution timeout in seconds (float or int)
+            enable_console: Whether ``console`` APIs are exposed (defaults to True)
+            inspector: Optional inspector configuration enabling Chrome DevTools
         """
         ...
 
@@ -102,6 +162,21 @@ class RuntimeConfig:
         """
         ...
 
+    @property
+    def enable_console(self) -> Optional[bool]:
+        """Whether ``console`` APIs are enabled inside the runtime."""
+        ...
+
+    @property
+    def inspector(self) -> Optional[InspectorConfig]:
+        """Inspector configuration if debugging is enabled."""
+        ...
+
+    @inspector.setter
+    def inspector(self, value: Optional[InspectorConfig]) -> None:
+        """Set or clear the inspector configuration."""
+        ...
+
     def __repr__(self) -> str: ...
 
 class RuntimeStats:
@@ -129,6 +204,22 @@ class RuntimeStats:
     open_resources: int
     active_timers: int
     active_intervals: int
+
+    def __repr__(self) -> str: ...
+
+class InspectorEndpoints:
+    """
+    Runtime inspector metadata exposing DevTools URLs.
+    """
+
+    id: str
+    websocket_url: str
+    devtools_frontend_url: str
+    title: str
+    description: str
+    target_url: str
+    favicon_url: str
+    host: str
 
     def __repr__(self) -> str: ...
 
@@ -338,6 +429,16 @@ class Runtime:
 
         Returns:
             RuntimeStats: Structured metrics describing the runtime state.
+        """
+        ...
+
+    def inspector_endpoints(self) -> Optional[InspectorEndpoints]:
+        """
+        Return the DevTools endpoints if the inspector is enabled.
+
+        Returns:
+            InspectorEndpoints describing websocket and devtools:// URLs,
+            or ``None`` when the runtime was created without inspector support.
         """
         ...
 

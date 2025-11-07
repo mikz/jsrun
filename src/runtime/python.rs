@@ -4,6 +4,7 @@ use super::config::RuntimeConfig;
 use super::conversion::{js_value_to_python, python_to_js_value};
 use super::error::{JsExceptionDetails, RuntimeError, RuntimeResult};
 use super::handle::RuntimeHandle;
+use super::inspector::InspectorMetadata;
 use super::js_value::JSValue;
 use super::ops::PythonOpMode;
 use super::stats::{RuntimeCallKind, RuntimeStatsSnapshot};
@@ -504,6 +505,52 @@ impl RuntimeStats {
     }
 }
 
+#[pyclass(module = "jsrun")]
+#[derive(Clone)]
+pub struct InspectorEndpoints {
+    #[pyo3(get)]
+    id: String,
+    #[pyo3(get)]
+    websocket_url: String,
+    #[pyo3(get)]
+    devtools_frontend_url: String,
+    #[pyo3(get)]
+    title: String,
+    #[pyo3(get)]
+    description: String,
+    #[pyo3(get)]
+    target_url: String,
+    #[pyo3(get)]
+    favicon_url: String,
+    #[pyo3(get)]
+    host: String,
+}
+
+impl From<InspectorMetadata> for InspectorEndpoints {
+    fn from(meta: InspectorMetadata) -> Self {
+        Self {
+            id: meta.id,
+            websocket_url: meta.websocket_url,
+            devtools_frontend_url: meta.devtools_frontend_url,
+            title: meta.title,
+            description: meta.description,
+            target_url: meta.target_url,
+            favicon_url: meta.favicon_url,
+            host: meta.host,
+        }
+    }
+}
+
+#[pymethods]
+impl InspectorEndpoints {
+    fn __repr__(&self) -> String {
+        format!(
+            "InspectorEndpoints(id={}, websocket_url={}, devtools_frontend_url={})",
+            self.id, self.websocket_url, self.devtools_frontend_url
+        )
+    }
+}
+
 impl Runtime {
     fn init_with_config(config: RuntimeConfig) -> PyResult<Self> {
         let handle = RuntimeHandle::spawn(config)
@@ -685,6 +732,17 @@ impl Runtime {
             .detach(|| handle.get_stats())
             .map_err(|e| runtime_error_with_context("Failed to obtain runtime stats", e))?;
         Ok(RuntimeStats::from_snapshot(snapshot))
+    }
+
+    fn inspector_endpoints(&self) -> PyResult<Option<InspectorEndpoints>> {
+        let handle = self
+            .handle
+            .borrow()
+            .as_ref()
+            .ok_or_else(|| PyRuntimeError::new_err("Runtime has been closed"))?
+            .clone();
+
+        Ok(handle.inspector_metadata().map(InspectorEndpoints::from))
     }
 
     fn _debug_tracked_function_count(&self) -> PyResult<usize> {

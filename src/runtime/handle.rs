@@ -2,6 +2,7 @@
 
 use crate::runtime::config::RuntimeConfig;
 use crate::runtime::error::{RuntimeError, RuntimeResult};
+use crate::runtime::inspector::{InspectorConnectionState, InspectorMetadata};
 use crate::runtime::js_value::JSValue;
 use crate::runtime::ops::PythonOpMode;
 use crate::runtime::runner::{spawn_runtime_thread, RuntimeCommand, TerminationController};
@@ -24,16 +25,23 @@ pub struct RuntimeHandle {
     shutdown: Arc<Mutex<bool>>,
     termination: TerminationController,
     tracked_functions: Arc<Mutex<HashSet<u32>>>,
+    inspector_metadata: Arc<Mutex<Option<InspectorMetadata>>>,
+    inspector_connection: Option<InspectorConnectionState>,
 }
 
 impl RuntimeHandle {
     pub fn spawn(config: RuntimeConfig) -> RuntimeResult<Self> {
-        let (tx, termination) = spawn_runtime_thread(config)?;
+        let (tx, termination, inspector_info) = spawn_runtime_thread(config)?;
+        let (metadata, connection) = inspector_info
+            .map(|(meta, state)| (Some(meta), Some(state)))
+            .unwrap_or((None, None));
         Ok(Self {
             tx: Some(tx),
             shutdown: Arc::new(Mutex::new(false)),
             termination,
             tracked_functions: Arc::new(Mutex::new(HashSet::new())),
+            inspector_metadata: Arc::new(Mutex::new(metadata)),
+            inspector_connection: connection,
         })
     }
 
@@ -277,6 +285,10 @@ impl RuntimeHandle {
             .map_err(|_| RuntimeError::internal("Failed to receive stats result"))?
     }
 
+    pub fn inspector_connection(&self) -> Option<InspectorConnectionState> {
+        self.inspector_connection.clone()
+    }
+
     pub fn is_shutdown(&self) -> bool {
         self.termination.is_requested()
             || self.termination.is_terminated()
@@ -385,5 +397,9 @@ impl RuntimeHandle {
     pub fn tracked_function_count(&self) -> usize {
         let set = self.tracked_functions.lock().unwrap();
         set.len()
+    }
+
+    pub fn inspector_metadata(&self) -> Option<InspectorMetadata> {
+        self.inspector_metadata.lock().unwrap().clone()
     }
 }

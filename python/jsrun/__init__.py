@@ -5,6 +5,8 @@ from __future__ import annotations
 from typing import Any, Callable, Optional, TypeVar, overload
 
 from ._jsrun import (
+    InspectorConfig,
+    InspectorEndpoints,
     JavaScriptError,
     JsFunction,
     JsUndefined,
@@ -57,6 +59,8 @@ def _runtime_bind(
 setattr(Runtime, "bind", _runtime_bind)
 
 __all__ = [
+    "InspectorConfig",
+    "InspectorEndpoints",
     "JavaScriptError",
     "JsFunction",
     "JsUndefined",

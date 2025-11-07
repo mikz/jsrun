@@ -8,6 +8,7 @@ pub mod config;
 pub mod conversion;
 pub mod error;
 pub mod handle;
+pub mod inspector;
 pub mod js_value;
 pub mod loader;
 pub mod ops;
