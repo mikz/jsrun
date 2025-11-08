@@ -342,7 +342,7 @@ class Runtime:
             JavaScriptError: If JavaScript code throws an exception
 
         Example:
-            >>> runtime = v8.Runtime()
+            >>> runtime = Runtime()
             >>> result = runtime.eval("1 + 1")
             >>> print(result)
             2
@@ -371,7 +371,7 @@ class Runtime:
             PromiseTimeoutError: If timeout is exceeded
 
         Example:
-            >>> runtime = v8.Runtime()
+            >>> runtime = Runtime()
             >>> result = await runtime.eval_async("Promise.resolve(42)")
             >>> print(result)
             42
@@ -481,7 +481,7 @@ class Runtime:
             event loop not running.
 
         Example:
-            >>> runtime = v8.Runtime()
+            >>> runtime = Runtime()
             >>> def add(a, b): return a + b
             >>> runtime.bind_function("add", add)
             >>> runtime.eval("add(1, 2)")
@@ -499,6 +499,7 @@ class Runtime:
         self, handler: None = ..., /, *, name: Optional[str] = ...
     ) -> Callable[[F], F]:
         """Return a decorator for binding sync or async callables to ``globalThis``."""
+        ...
 
     def bind_object(self, name: str, obj: Mapping[str, Any]) -> None:
         """
@@ -514,7 +515,7 @@ class Runtime:
                 callables
 
         Example:
-            >>> runtime = v8.Runtime()
+            >>> runtime = Runtime()
             >>> def add(a, b):
             ...     return a + b
             >>> runtime.bind_object("api", {"add": add, "value": 42})
