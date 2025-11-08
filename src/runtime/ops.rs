@@ -156,7 +156,7 @@ fn op_jsrun_call_python_async(
         .ok_or_else(|| JsErrorBox::type_error("GlobalTaskLocals not found in OpState"))?
         .clone();
 
-    let concurrent_future = Python::attach(|py| -> Result<Py<PyAny>, JsErrorBox> {
+    let coroutine = Python::attach(|py| -> Result<Py<PyAny>, JsErrorBox> {
         let py_args = args
             .iter()
             .map(|arg| js_value_to_python(py, arg, None).map_err(map_pyerr))
@@ -166,44 +166,35 @@ fn op_jsrun_call_python_async(
             .handler
             .call(py, py_args_tuple, None)
             .map_err(map_pyerr)?;
-        let coroutine = awaitable.into_bound(py);
-        let locals = global_locals.0.as_ref().ok_or_else(|| {
+
+        // Validate that we have task locals with a running event loop
+        let _locals = global_locals.0.as_ref().ok_or_else(|| {
             JsErrorBox::type_error(
                 "Async op requires asyncio context. Call eval_async() first to establish context.",
             )
         })?;
-        let event_loop = locals.event_loop(py);
-        let is_running = event_loop
-            .call_method0(pyo3::intern!(py, "is_running"))
-            .map_err(map_pyerr)?
-            .extract::<bool>()
-            .map_err(map_pyerr)?;
-        if !is_running {
-            return Err(JsErrorBox::type_error(
-                "Python event loop is not running for async op",
-            ));
-        }
-        let asyncio = py.import("asyncio").map_err(map_pyerr)?;
-        let future = asyncio
-            .call_method1(
-                pyo3::intern!(py, "run_coroutine_threadsafe"),
-                (coroutine, event_loop),
-            )
-            .map_err(map_pyerr)?;
-        Ok(future.unbind())
+
+        Ok(awaitable)
     })?;
 
+    // Use into_future_with_locals to properly await the Python coroutine
+    // This allows the Rust future to be suspended and resumed, enabling re-entrancy
+    let task_locals = global_locals
+        .0
+        .ok_or_else(|| JsErrorBox::type_error("TaskLocals not available for async op"))?;
+
     Ok(async move {
-        let result = tokio::task::spawn_blocking(move || {
-            Python::attach(|py| -> Result<Py<PyAny>, JsErrorBox> {
-                let fut = concurrent_future.bind(py);
-                fut.call_method0(pyo3::intern!(py, "result"))
-                    .map(|value| value.into())
-                    .map_err(map_pyerr)
-            })
+        // Convert the coroutine future using into_future_with_locals
+        // This must be done with GIL acquired
+        let future = Python::attach(|py| {
+            let bound_coroutine = coroutine.bind(py).clone();
+            pyo3_async_runtimes::into_future_with_locals(&task_locals, bound_coroutine)
         })
-        .await
-        .map_err(|err| JsErrorBox::type_error(err.to_string()))??;
+        .map_err(|err| JsErrorBox::type_error(format!("Python coroutine error: {}", err)))?;
+
+        let result = future
+            .await
+            .map_err(|err| JsErrorBox::type_error(format!("Python coroutine failed: {}", err)))?;
 
         Python::attach(|py| python_to_js_value(result.into_bound(py)).map_err(map_pyerr))
     })

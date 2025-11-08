@@ -45,6 +45,10 @@ impl PythonModuleLoader {
         *self.task_locals.borrow_mut() = Some(task_locals);
     }
 
+    pub fn clear_task_locals(&self) {
+        *self.task_locals.borrow_mut() = None;
+    }
+
     fn resolve_static(&self, specifier: &str) -> Option<String> {
         // Strip "static:" prefix if present
         let bare_specifier = specifier.strip_prefix("static:").unwrap_or(specifier);

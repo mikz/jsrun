@@ -184,6 +184,1004 @@ pub enum RuntimeCommand {
     },
 }
 
+/// Dispatcher that multiplexes command processing with async job execution.
+struct RuntimeDispatcher {
+    core: RuntimeCoreState,
+    cmd_rx: mpsc::UnboundedReceiver<RuntimeCommand>,
+    pending_jobs: std::collections::VecDeque<Box<dyn RuntimeJob>>,
+    active_job: Option<Box<dyn RuntimeJob>>,
+}
+
+impl RuntimeDispatcher {
+    fn new(core: RuntimeCoreState, cmd_rx: mpsc::UnboundedReceiver<RuntimeCommand>) -> Self {
+        Self {
+            core,
+            cmd_rx,
+            pending_jobs: std::collections::VecDeque::new(),
+            active_job: None,
+        }
+    }
+
+    async fn run(&mut self) {
+        loop {
+            // 1. SYNCHRONOUSLY drive the JavaScript event loop
+            // This advances all promises, timers, and async ops one tick
+            // Non-blocking - returns immediately even if work is pending
+            let noop_waker = futures::task::noop_waker();
+            let mut cx = std::task::Context::from_waker(&noop_waker);
+            let poll_opts = PollEventLoopOptions {
+                wait_for_inspector: false,
+                pump_v8_message_loop: true,
+            };
+
+            // Check for event loop errors
+            // Note: Termination errors (from timeout/abort) are expected and will be handled
+            // by the job's own poll() method. Only fail the job on unexpected fatal errors.
+            match self.core.js_runtime.poll_event_loop(&mut cx, poll_opts) {
+                std::task::Poll::Ready(Err(err)) => {
+                    let runtime_err = self.core.translate_core_error(err);
+
+                    // Check if this is a termination-related error (expected during timeout/abort)
+                    if RuntimeCoreState::runtime_error_indicates_termination(&runtime_err) {
+                        // Termination error - let the job handle it via its own timeout check
+                        // Do nothing here, just continue to job polling
+                    } else {
+                        // Unexpected fatal error - fail the active job immediately
+                        let runtime_err_debug = format!("{runtime_err:?}");
+                        if let Some(completed_job) = self.active_job.take() {
+                            tracing::error!("Unexpected event loop error: {runtime_err_debug}");
+                            let elapsed = completed_job.start_time().elapsed();
+                            self.core.stats_state.record(completed_job.kind(), elapsed);
+                            completed_job.send_result(Err(runtime_err));
+                            self.core.clear_task_locals();
+                            if let Some(next_job) = self.pending_jobs.pop_front() {
+                                self.active_job = Some(next_job);
+                            }
+                        } else {
+                            tracing::error!(
+                                "JavaScript event loop failed without an active job: {runtime_err_debug}"
+                            );
+                        }
+                        continue;
+                    }
+                }
+                std::task::Poll::Ready(Ok(())) | std::task::Poll::Pending => {
+                    // Normal - event loop completed or has pending work
+                }
+            }
+
+            // 2. SYNCHRONOUSLY check if the active job is complete
+            if let Some(job) = &mut self.active_job {
+                match job.poll(&mut self.core) {
+                    std::task::Poll::Ready(result) => {
+                        // Job completed - record stats and send result
+                        let completed_job = self.active_job.take().unwrap();
+                        let elapsed = completed_job.start_time().elapsed();
+                        self.core.stats_state.record(completed_job.kind(), elapsed);
+                        completed_job.send_result(result);
+
+                        // Clear task locals to prevent stale event loop references
+                        self.core.clear_task_locals();
+
+                        // Start the next pending job if any
+                        if let Some(next_job) = self.pending_jobs.pop_front() {
+                            self.active_job = Some(next_job);
+                        }
+                    }
+                    std::task::Poll::Pending => {
+                        // Job still running - continue
+                    }
+                }
+            }
+
+            // 3. ASYNCHRONOUSLY wait for new commands or yield to allow other tasks to run
+            let should_exit = tokio::select! {
+                biased; // Prefer new commands over yielding
+
+                // New command from Python
+                Some(cmd) = self.cmd_rx.recv() => {
+                    self.handle_command(cmd)
+                }
+
+                // No new commands - yield to allow tokio to schedule other tasks
+                _ = tokio::task::yield_now() => {
+                    false
+                }
+            };
+
+            if should_exit {
+                break;
+            }
+        }
+    }
+
+    /// Handle a command - returns true if dispatcher should exit
+    fn handle_command(&mut self, cmd: RuntimeCommand) -> bool {
+        match cmd {
+            RuntimeCommand::Eval { code, responder } => {
+                let result = if self.core.should_reject_new_work() {
+                    Err(RuntimeError::terminated())
+                } else if let Err(err) = self.core.ensure_inspector_ready() {
+                    Err(err)
+                } else {
+                    match self.core.start_sync_watchdog() {
+                        Ok(watchdog) => {
+                            let result = self.core.eval_sync(&code);
+                            self.core
+                                .apply_watchdog_result(result, watchdog, "Sync evaluation")
+                        }
+                        Err(err) => Err(err),
+                    }
+                };
+                let _ = responder.send(result);
+                false
+            }
+            RuntimeCommand::EvalAsync {
+                code,
+                timeout_ms,
+                task_locals,
+                responder,
+            } => {
+                if self.core.should_reject_new_work() {
+                    let _ = responder.send(Err(RuntimeError::terminated()));
+                    return false;
+                }
+                if let Err(err) = self.core.ensure_inspector_ready() {
+                    let _ = responder.send(Err(err));
+                    return false;
+                }
+
+                // Create the job
+                let job =
+                    EvalAsyncJob::new(code.clone(), timeout_ms, task_locals, responder, &self.core);
+
+                // Queue or activate the job
+                if self.active_job.is_none() {
+                    self.active_job = Some(Box::new(job));
+                } else {
+                    // Another job is active - queue this one
+                    self.pending_jobs.push_back(Box::new(job));
+                }
+                false
+            }
+            RuntimeCommand::RegisterPythonOp {
+                name,
+                mode,
+                handler,
+                responder,
+            } => {
+                let result = if self.core.should_reject_new_work() {
+                    Err(RuntimeError::terminated())
+                } else {
+                    self.core.register_python_op(name, mode, handler)
+                };
+                let _ = responder.send(result);
+                false
+            }
+            RuntimeCommand::SetModuleResolver { handler, responder } => {
+                let result = if self.core.should_reject_new_work() {
+                    Err(RuntimeError::terminated())
+                } else {
+                    self.core.module_loader.set_resolver(handler);
+                    if let Some(ref locals) = self.core.task_locals {
+                        self.core.module_loader.set_task_locals(locals.clone());
+                    }
+                    Ok(())
+                };
+                let _ = responder.send(result);
+                false
+            }
+            RuntimeCommand::SetModuleLoader { handler, responder } => {
+                let result = if self.core.should_reject_new_work() {
+                    Err(RuntimeError::terminated())
+                } else {
+                    self.core.module_loader.set_loader(handler);
+                    if let Some(ref locals) = self.core.task_locals {
+                        self.core.module_loader.set_task_locals(locals.clone());
+                    }
+                    Ok(())
+                };
+                let _ = responder.send(result);
+                false
+            }
+            RuntimeCommand::AddStaticModule {
+                name,
+                source,
+                responder,
+            } => {
+                let result = if self.core.should_reject_new_work() {
+                    Err(RuntimeError::terminated())
+                } else {
+                    self.core.module_loader.add_static_module(name, source);
+                    Ok(())
+                };
+                let _ = responder.send(result);
+                false
+            }
+            RuntimeCommand::EvalModule {
+                specifier,
+                responder,
+            } => {
+                let result = if self.core.should_reject_new_work() {
+                    Err(RuntimeError::terminated())
+                } else if let Err(err) = self.core.ensure_inspector_ready() {
+                    Err(err)
+                } else {
+                    match self.core.start_sync_watchdog() {
+                        Ok(watchdog) => {
+                            let result = self.core.eval_module_sync(&specifier);
+                            self.core.apply_watchdog_result(
+                                result,
+                                watchdog,
+                                "Sync module evaluation",
+                            )
+                        }
+                        Err(err) => Err(err),
+                    }
+                };
+                let _ = responder.send(result);
+                false
+            }
+            RuntimeCommand::EvalModuleAsync {
+                specifier,
+                timeout_ms,
+                task_locals,
+                responder,
+            } => {
+                if self.core.should_reject_new_work() {
+                    let _ = responder.send(Err(RuntimeError::terminated()));
+                    return false;
+                }
+                if let Err(err) = self.core.ensure_inspector_ready() {
+                    let _ = responder.send(Err(err));
+                    return false;
+                }
+
+                // Create the job
+                let job = EvalModuleAsyncJob::new(
+                    specifier,
+                    timeout_ms,
+                    task_locals,
+                    responder,
+                    &self.core,
+                );
+
+                // Queue or activate the job
+                if self.active_job.is_none() {
+                    self.active_job = Some(Box::new(job));
+                } else {
+                    self.pending_jobs.push_back(Box::new(job));
+                }
+                false
+            }
+            RuntimeCommand::CallFunctionAsync {
+                fn_id,
+                args,
+                timeout_ms,
+                task_locals,
+                responder,
+            } => {
+                if self.core.should_reject_new_work() {
+                    let _ = responder.send(Err(RuntimeError::terminated()));
+                    return false;
+                }
+                if let Err(err) = self.core.ensure_inspector_ready() {
+                    let _ = responder.send(Err(err));
+                    return false;
+                }
+
+                // Create the job
+                let job = CallFunctionAsyncJob::new(
+                    fn_id,
+                    args,
+                    timeout_ms,
+                    task_locals,
+                    responder,
+                    &self.core,
+                );
+
+                // Queue or activate the job
+                if self.active_job.is_none() {
+                    self.active_job = Some(Box::new(job));
+                } else {
+                    self.pending_jobs.push_back(Box::new(job));
+                }
+                false
+            }
+            RuntimeCommand::ReleaseFunction { fn_id, responder } => {
+                let result = if self.core.should_reject_new_work() {
+                    Err(RuntimeError::terminated())
+                } else {
+                    self.core.release_function(fn_id)
+                };
+                let _ = responder.send(result);
+                false
+            }
+            RuntimeCommand::GetStats { responder } => {
+                let result = self.core.collect_stats();
+                let _ = responder.send(result);
+                false
+            }
+            RuntimeCommand::Terminate { responder } => {
+                // Cancel active job if exists
+                if let Some(job) = self.active_job.take() {
+                    tracing::debug!("Terminating active job on interrupt");
+                    job.send_result(Err(RuntimeError::terminated()));
+                }
+
+                // Cancel all pending jobs
+                let pending_count = self.pending_jobs.len();
+                if pending_count > 0 {
+                    tracing::debug!(count = pending_count, "Cancelling pending jobs");
+                }
+                while let Some(job) = self.pending_jobs.pop_front() {
+                    job.send_result(Err(RuntimeError::terminated()));
+                }
+
+                // Clear task locals to prevent stale event loop references
+                self.core.clear_task_locals();
+
+                let result = self.core.finalize_termination();
+                let _ = responder.send(result);
+                self.cmd_rx.close();
+                true // Exit the loop
+            }
+            RuntimeCommand::Shutdown { responder } => {
+                let leaked_count = self.core.fn_registry.borrow().len();
+                if leaked_count > 0 {
+                    tracing::warn!(
+                        leaked_count,
+                        "Function handles not released before shutdown"
+                    );
+                }
+                self.core.fn_registry.borrow_mut().clear();
+
+                // Clear task locals on shutdown
+                self.core.clear_task_locals();
+
+                let _ = responder.send(());
+                self.cmd_rx.close();
+                true // Exit the loop
+            }
+        }
+    }
+}
+
+/// Trait for async runtime jobs that can be polled without holding long-term borrows.
+/// Jobs are state machines that advance one step at a time.
+trait RuntimeJob {
+    /// Returns the kind of runtime call for stats tracking
+    fn kind(&self) -> RuntimeCallKind;
+
+    /// Poll the job for one tick. Returns Poll::Ready when complete.
+    /// The job can borrow core mutably but must release it before returning.
+    fn poll(&mut self, core: &mut RuntimeCoreState) -> std::task::Poll<RuntimeResult<JSValue>>;
+
+    /// Send the result back to the caller
+    fn send_result(self: Box<Self>, result: RuntimeResult<JSValue>);
+
+    /// Get the start time for stats tracking
+    fn start_time(&self) -> Instant;
+}
+
+/// State machine for async JavaScript evaluation
+struct EvalAsyncJob {
+    code: String,
+    timeout_ms: Option<u64>,
+    task_locals: Option<TaskLocals>,
+    responder: oneshot::Sender<RuntimeResult<JSValue>>,
+    start_time: Instant,
+    deadline: Option<Instant>,
+    state: EvalAsyncJobState,
+}
+
+enum EvalAsyncJobState {
+    /// Initial state - need to execute script and get promise
+    Init,
+    /// Waiting for promise to resolve (dispatcher drives event loop)
+    Waiting {
+        /// The promise being resolved - dispatcher drives it via poll_event_loop
+        promise: v8::Global<v8::Promise>,
+    },
+    /// Job completed
+    Done,
+}
+
+impl EvalAsyncJob {
+    fn new(
+        code: String,
+        timeout_ms: Option<u64>,
+        task_locals: Option<TaskLocals>,
+        responder: oneshot::Sender<RuntimeResult<JSValue>>,
+        core: &RuntimeCoreState,
+    ) -> Self {
+        let start_time = Instant::now();
+
+        // Determine effective timeout
+        let effective_timeout = timeout_ms.or_else(|| {
+            core.execution_timeout.map(|d| {
+                let millis = d.as_millis();
+                if millis > u128::from(u64::MAX) {
+                    u64::MAX
+                } else {
+                    millis as u64
+                }
+            })
+        });
+
+        let deadline = effective_timeout.map(|ms| start_time + Duration::from_millis(ms));
+
+        Self {
+            code,
+            timeout_ms: effective_timeout,
+            task_locals,
+            responder,
+            start_time,
+            deadline,
+            state: EvalAsyncJobState::Init,
+        }
+    }
+}
+
+impl RuntimeJob for EvalAsyncJob {
+    fn kind(&self) -> RuntimeCallKind {
+        RuntimeCallKind::EvalAsync
+    }
+
+    fn poll(&mut self, core: &mut RuntimeCoreState) -> std::task::Poll<RuntimeResult<JSValue>> {
+        use std::task::Poll;
+
+        // Check timeout first
+        if let Some(deadline) = self.deadline {
+            if Instant::now() >= deadline {
+                core.termination.terminate_execution();
+                return Poll::Ready(Err(RuntimeError::timeout(format!(
+                    "Evaluation timed out after {}ms (promise still pending)",
+                    self.timeout_ms.unwrap_or(0)
+                ))));
+            }
+        }
+
+        match &mut self.state {
+            EvalAsyncJobState::Init => {
+                // Set up task locals
+                if let Some(ref locals) = self.task_locals {
+                    core.task_locals = Some(locals.clone());
+                    core.module_loader.set_task_locals(locals.clone());
+                    core.js_runtime
+                        .op_state()
+                        .borrow_mut()
+                        .put(crate::runtime::ops::GlobalTaskLocals(Some(locals.clone())));
+                }
+
+                // Execute the script
+                let global_value = match core
+                    .js_runtime
+                    .execute_script("<eval_async>", self.code.clone())
+                {
+                    Ok(val) => val,
+                    Err(err) => return Poll::Ready(Err(core.translate_js_error(*err))),
+                };
+
+                // Resolve the value to a promise
+                // The resolve() call wraps the value in a promise if it isn't already one
+                let scope = &mut core.js_runtime.handle_scope();
+                let local_value = v8::Local::new(scope, global_value);
+
+                // Check if it's already a promise
+                let promise = if local_value.is_promise() {
+                    // Already a promise - use it directly
+                    v8::Local::<v8::Promise>::try_from(local_value)
+                        .map_err(|_| RuntimeError::internal("Failed to cast to Promise"))?
+                } else {
+                    // Not a promise - wrap in a resolved promise
+                    let resolver = v8::PromiseResolver::new(scope).ok_or_else(|| {
+                        RuntimeError::internal("Failed to create PromiseResolver")
+                    })?;
+                    resolver.resolve(scope, local_value);
+                    resolver.get_promise(scope)
+                };
+
+                // Store the promise as a Global handle
+                let promise_global = v8::Global::new(scope, promise);
+
+                // Transition to waiting state
+                self.state = EvalAsyncJobState::Waiting {
+                    promise: promise_global,
+                };
+
+                // Return pending - dispatcher will drive the event loop
+                Poll::Pending
+            }
+            EvalAsyncJobState::Waiting { promise } => {
+                // Check the promise state (dispatcher has been driving the event loop)
+                let promise_state = {
+                    let scope = &mut core.js_runtime.handle_scope();
+                    let promise_local: v8::Local<v8::Promise> = v8::Local::new(scope, &*promise);
+                    promise_local.state()
+                };
+
+                match promise_state {
+                    v8::PromiseState::Pending => {
+                        // Still pending - dispatcher will continue driving event loop
+                        Poll::Pending
+                    }
+                    v8::PromiseState::Fulfilled => {
+                        // Promise resolved successfully
+                        let scope = &mut core.js_runtime.handle_scope();
+                        let promise_local: v8::Local<v8::Promise> =
+                            v8::Local::new(scope, &*promise);
+                        let result_value = promise_local.result(scope);
+                        let result = RuntimeCoreState::value_to_js_value(
+                            &core.fn_registry,
+                            &core.next_fn_id,
+                            scope,
+                            result_value,
+                        );
+                        self.state = EvalAsyncJobState::Done;
+                        Poll::Ready(result)
+                    }
+                    v8::PromiseState::Rejected => {
+                        // Promise was rejected - extract error while scope is active
+                        let js_error = {
+                            let scope = &mut core.js_runtime.handle_scope();
+                            let promise_local: v8::Local<v8::Promise> =
+                                v8::Local::new(scope, &*promise);
+                            let exception = promise_local.result(scope);
+                            *JsError::from_v8_exception(scope, exception)
+                        };
+                        // Scope dropped, now we can borrow core again
+                        let error = core.translate_js_error(js_error);
+                        self.state = EvalAsyncJobState::Done;
+                        Poll::Ready(Err(error))
+                    }
+                }
+            }
+            EvalAsyncJobState::Done => {
+                Poll::Ready(Err(RuntimeError::internal("Job already completed")))
+            }
+        }
+    }
+
+    fn send_result(self: Box<Self>, result: RuntimeResult<JSValue>) {
+        let _ = self.responder.send(result);
+    }
+
+    fn start_time(&self) -> Instant {
+        self.start_time
+    }
+}
+
+/// State machine for async module evaluation
+struct EvalModuleAsyncJob {
+    specifier: String,
+    timeout_ms: Option<u64>,
+    task_locals: Option<TaskLocals>,
+    responder: oneshot::Sender<RuntimeResult<JSValue>>,
+    start_time: Instant,
+    deadline: Option<Instant>,
+    state: EvalModuleAsyncJobState,
+}
+
+enum EvalModuleAsyncJobState {
+    /// Initial state - need to load module and start evaluation
+    Init,
+    /// Module loaded, evaluation in progress (polling receiver)
+    Evaluating {
+        module_id: deno_core::ModuleId,
+        receiver: std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), CoreError>>>>,
+    },
+    /// Evaluation complete, ready to extract namespace
+    WaitingNamespace { module_id: deno_core::ModuleId },
+    /// Done
+    Done,
+}
+
+impl EvalModuleAsyncJob {
+    fn new(
+        specifier: String,
+        timeout_ms: Option<u64>,
+        task_locals: Option<TaskLocals>,
+        responder: oneshot::Sender<RuntimeResult<JSValue>>,
+        core: &RuntimeCoreState,
+    ) -> Self {
+        let start_time = Instant::now();
+
+        let effective_timeout = timeout_ms.or_else(|| {
+            core.execution_timeout.map(|d| {
+                let millis = d.as_millis();
+                if millis > u128::from(u64::MAX) {
+                    u64::MAX
+                } else {
+                    millis as u64
+                }
+            })
+        });
+
+        let deadline = effective_timeout.map(|ms| start_time + Duration::from_millis(ms));
+
+        Self {
+            specifier,
+            timeout_ms: effective_timeout,
+            task_locals,
+            responder,
+            start_time,
+            deadline,
+            state: EvalModuleAsyncJobState::Init,
+        }
+    }
+}
+
+impl RuntimeJob for EvalModuleAsyncJob {
+    fn kind(&self) -> RuntimeCallKind {
+        RuntimeCallKind::EvalModuleAsync
+    }
+
+    fn poll(&mut self, core: &mut RuntimeCoreState) -> std::task::Poll<RuntimeResult<JSValue>> {
+        use std::task::Poll;
+
+        // Check timeout
+        if let Some(deadline) = self.deadline {
+            if Instant::now() >= deadline {
+                core.termination.terminate_execution();
+                return Poll::Ready(Err(RuntimeError::timeout(format!(
+                    "Module evaluation timed out after {}ms",
+                    self.timeout_ms.unwrap_or(0)
+                ))));
+            }
+        }
+
+        match &mut self.state {
+            EvalModuleAsyncJobState::Init => {
+                // Set up task locals
+                if let Some(ref locals) = self.task_locals {
+                    core.task_locals = Some(locals.clone());
+                    core.module_loader.set_task_locals(locals.clone());
+                    core.js_runtime
+                        .op_state()
+                        .borrow_mut()
+                        .put(crate::runtime::ops::GlobalTaskLocals(Some(locals.clone())));
+                }
+
+                // Parse module specifier
+                let module_specifier =
+                    if self.specifier.contains(':') || self.specifier.starts_with('/') {
+                        deno_core::ModuleSpecifier::parse(&self.specifier).map_err(|e| {
+                            RuntimeError::internal(format!(
+                                "Invalid module specifier '{}': {}",
+                                self.specifier, e
+                            ))
+                        })?
+                    } else {
+                        let base =
+                            deno_core::ModuleSpecifier::parse("jsrun://runtime/").map_err(|e| {
+                                RuntimeError::internal(format!("Failed to create base URL: {}", e))
+                            })?;
+                        base.join(&self.specifier).map_err(|e| {
+                            RuntimeError::internal(format!(
+                                "Failed to resolve module specifier '{}': {}",
+                                self.specifier, e
+                            ))
+                        })?
+                    };
+
+                // Load module synchronously (module loading is inherently blocking in deno_core)
+                // This is consistent with eval_module_sync and doesn't prevent re-entrancy
+                // because the actual async work (promise resolution) happens in the Evaluating state
+                let module_id = futures::executor::block_on(
+                    core.js_runtime.load_main_es_module(&module_specifier),
+                )
+                .map_err(|e| {
+                    RuntimeError::internal(format!(
+                        "Failed to load module '{}': {}",
+                        self.specifier, e
+                    ))
+                })?;
+
+                // Start evaluation - this returns a future that we'll poll
+                let receiver = Box::pin(core.js_runtime.mod_evaluate(module_id));
+
+                self.state = EvalModuleAsyncJobState::Evaluating {
+                    module_id,
+                    receiver,
+                };
+                Poll::Pending
+            }
+            EvalModuleAsyncJobState::Evaluating {
+                module_id,
+                receiver,
+            } => {
+                // The dispatcher is driving poll_event_loop which will progress the module evaluation
+                // We need to poll the receiver to see if it's done
+                let noop_waker = futures::task::noop_waker();
+                let mut cx = std::task::Context::from_waker(&noop_waker);
+
+                match receiver.as_mut().poll(&mut cx) {
+                    Poll::Ready(result) => {
+                        // Evaluation complete - check result
+                        if let Err(err) = result {
+                            self.state = EvalModuleAsyncJobState::Done;
+                            return Poll::Ready(Err(core.translate_core_error(err)));
+                        }
+
+                        // Success - transition to namespace extraction
+                        self.state = EvalModuleAsyncJobState::WaitingNamespace {
+                            module_id: *module_id,
+                        };
+                        Poll::Pending
+                    }
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+            EvalModuleAsyncJobState::WaitingNamespace { module_id } => {
+                // Extract module namespace
+                let module_namespace =
+                    core.js_runtime
+                        .get_module_namespace(*module_id)
+                        .map_err(|e| {
+                            RuntimeError::internal(format!("Failed to get module namespace: {}", e))
+                        })?;
+
+                let scope = &mut core.js_runtime.handle_scope();
+                let local = deno_core::v8::Local::new(scope, module_namespace);
+                let result = RuntimeCoreState::value_to_js_value(
+                    &core.fn_registry,
+                    &core.next_fn_id,
+                    scope,
+                    local.into(),
+                );
+
+                self.state = EvalModuleAsyncJobState::Done;
+                Poll::Ready(result)
+            }
+            EvalModuleAsyncJobState::Done => {
+                Poll::Ready(Err(RuntimeError::internal("Job already completed")))
+            }
+        }
+    }
+
+    fn send_result(self: Box<Self>, result: RuntimeResult<JSValue>) {
+        let _ = self.responder.send(result);
+    }
+
+    fn start_time(&self) -> Instant {
+        self.start_time
+    }
+}
+
+/// State machine for async function calls
+struct CallFunctionAsyncJob {
+    fn_id: u32,
+    args: Vec<JSValue>,
+    timeout_ms: Option<u64>,
+    task_locals: Option<TaskLocals>,
+    responder: oneshot::Sender<RuntimeResult<JSValue>>,
+    start_time: Instant,
+    deadline: Option<Instant>,
+    state: CallFunctionAsyncJobState,
+}
+
+enum CallFunctionAsyncJobState {
+    Init,
+    Waiting { promise: v8::Global<v8::Promise> },
+    Done,
+}
+
+impl CallFunctionAsyncJob {
+    fn new(
+        fn_id: u32,
+        args: Vec<JSValue>,
+        timeout_ms: Option<u64>,
+        task_locals: Option<TaskLocals>,
+        responder: oneshot::Sender<RuntimeResult<JSValue>>,
+        core: &RuntimeCoreState,
+    ) -> Self {
+        let start_time = Instant::now();
+
+        let effective_timeout = timeout_ms.or_else(|| {
+            core.execution_timeout.map(|d| {
+                let millis = d.as_millis();
+                if millis > u128::from(u64::MAX) {
+                    u64::MAX
+                } else {
+                    millis as u64
+                }
+            })
+        });
+
+        let deadline = effective_timeout.map(|ms| start_time + Duration::from_millis(ms));
+
+        Self {
+            fn_id,
+            args,
+            timeout_ms: effective_timeout,
+            task_locals,
+            responder,
+            start_time,
+            deadline,
+            state: CallFunctionAsyncJobState::Init,
+        }
+    }
+}
+
+impl RuntimeJob for CallFunctionAsyncJob {
+    fn kind(&self) -> RuntimeCallKind {
+        RuntimeCallKind::CallFunctionAsync
+    }
+
+    fn poll(&mut self, core: &mut RuntimeCoreState) -> std::task::Poll<RuntimeResult<JSValue>> {
+        use std::task::Poll;
+
+        // Check timeout
+        if let Some(deadline) = self.deadline {
+            if Instant::now() >= deadline {
+                core.termination.terminate_execution();
+                return Poll::Ready(Err(RuntimeError::timeout(format!(
+                    "Function call timed out after {}ms",
+                    self.timeout_ms.unwrap_or(0)
+                ))));
+            }
+        }
+
+        match &mut self.state {
+            CallFunctionAsyncJobState::Init => {
+                // Set up task locals
+                if let Some(ref locals) = self.task_locals {
+                    core.task_locals = Some(locals.clone());
+                    core.module_loader.set_task_locals(locals.clone());
+                    core.js_runtime
+                        .op_state()
+                        .borrow_mut()
+                        .put(crate::runtime::ops::GlobalTaskLocals(Some(locals.clone())));
+                }
+
+                // Look up function, call it, and convert result to promise - all in one scope
+                // Check for missing function first (before entering scope)
+                if !core.fn_registry.borrow().contains_key(&self.fn_id) {
+                    return Poll::Ready(Err(RuntimeError::internal(format!(
+                        "Function ID {} not found",
+                        self.fn_id
+                    ))));
+                }
+
+                let promise_result: Result<Result<v8::Global<v8::Promise>, JsError>, RuntimeError> =
+                    (|| {
+                        let scope = &mut core.js_runtime.handle_scope();
+                        let mut try_catch = v8::TryCatch::new(scope);
+
+                        // Get function and receiver from registry
+                        let (func, receiver) = {
+                            let registry = core.fn_registry.borrow();
+                            let stored = registry.get(&self.fn_id).unwrap(); // Safe: checked above
+                            let func = deno_core::v8::Local::new(&mut try_catch, &stored.function);
+                            let receiver = stored
+                                .receiver
+                                .as_ref()
+                                .map(|r| deno_core::v8::Local::new(&mut try_catch, r));
+                            (func, receiver)
+                        };
+
+                        // Convert arguments
+                        let mut v8_args = Vec::with_capacity(self.args.len());
+                        for arg in &self.args {
+                            let v8_val = RuntimeCoreState::js_value_to_v8(
+                                &core.fn_registry,
+                                &mut try_catch,
+                                arg,
+                            )?;
+                            v8_args.push(v8_val);
+                        }
+
+                        let call_receiver = receiver.unwrap_or_else(|| {
+                            try_catch
+                                .get_current_context()
+                                .global(&mut try_catch)
+                                .into()
+                        });
+
+                        // Call the function and convert result to promise
+                        match func.call(&mut try_catch, call_receiver, &v8_args) {
+                            Some(result_value) => {
+                                // Check if result is a promise and wrap if needed
+                                let promise = if result_value.is_promise() {
+                                    v8::Local::<v8::Promise>::try_from(result_value).map_err(
+                                        |_| RuntimeError::internal("Failed to cast to Promise"),
+                                    )?
+                                } else {
+                                    // Not a promise - wrap in resolved promise
+                                    let resolver = v8::PromiseResolver::new(&mut try_catch)
+                                        .ok_or_else(|| {
+                                            RuntimeError::internal(
+                                                "Failed to create PromiseResolver",
+                                            )
+                                        })?;
+                                    resolver.resolve(&mut try_catch, result_value);
+                                    resolver.get_promise(&mut try_catch)
+                                };
+                                Ok(Ok(v8::Global::new(&mut try_catch, promise)))
+                            }
+                            None => match try_catch.exception() {
+                                Some(exception) => {
+                                    let js_error =
+                                        JsError::from_v8_exception(&mut try_catch, exception);
+                                    Ok(Err(*js_error))
+                                }
+                                None => Err(RuntimeError::internal(
+                                    "Function call failed with no exception",
+                                )),
+                            },
+                        }
+                    })();
+
+                // Handle the result outside the scope
+                let promise_global = match promise_result {
+                    Ok(Ok(p)) => p,
+                    Ok(Err(js_error)) => {
+                        return Poll::Ready(Err(core.translate_js_error(js_error)));
+                    }
+                    Err(err) => {
+                        return Poll::Ready(Err(err));
+                    }
+                };
+
+                self.state = CallFunctionAsyncJobState::Waiting {
+                    promise: promise_global,
+                };
+                Poll::Pending
+            }
+            CallFunctionAsyncJobState::Waiting { promise } => {
+                // Check promise state
+                let promise_state = {
+                    let scope = &mut core.js_runtime.handle_scope();
+                    let promise_local: v8::Local<v8::Promise> = v8::Local::new(scope, &*promise);
+                    promise_local.state()
+                };
+
+                match promise_state {
+                    v8::PromiseState::Pending => Poll::Pending,
+                    v8::PromiseState::Fulfilled => {
+                        let scope = &mut core.js_runtime.handle_scope();
+                        let promise_local: v8::Local<v8::Promise> =
+                            v8::Local::new(scope, &*promise);
+                        let result_value = promise_local.result(scope);
+                        let result = RuntimeCoreState::value_to_js_value(
+                            &core.fn_registry,
+                            &core.next_fn_id,
+                            scope,
+                            result_value,
+                        );
+                        self.state = CallFunctionAsyncJobState::Done;
+                        Poll::Ready(result)
+                    }
+                    v8::PromiseState::Rejected => {
+                        let js_error = {
+                            let scope = &mut core.js_runtime.handle_scope();
+                            let promise_local: v8::Local<v8::Promise> =
+                                v8::Local::new(scope, &*promise);
+                            let exception = promise_local.result(scope);
+                            *JsError::from_v8_exception(scope, exception)
+                        };
+                        let error = core.translate_js_error(js_error);
+                        self.state = CallFunctionAsyncJobState::Done;
+                        Poll::Ready(Err(error))
+                    }
+                }
+            }
+            CallFunctionAsyncJobState::Done => {
+                Poll::Ready(Err(RuntimeError::internal("Job already completed")))
+            }
+        }
+    }
+
+    fn send_result(self: Box<Self>, result: RuntimeResult<JSValue>) {
+        let _ = self.responder.send(result);
+    }
+
+    fn start_time(&self) -> Instant {
+        self.start_time
+    }
+}
+
 pub fn spawn_runtime_thread(config: RuntimeConfig) -> RuntimeResult<SpawnRuntimeResult> {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<RuntimeCommand>();
     let (init_tx, init_rx): InitSignalChannel = std::sync::mpsc::channel();
@@ -196,7 +1194,7 @@ pub fn spawn_runtime_thread(config: RuntimeConfig) -> RuntimeResult<SpawnRuntime
                 .build()
                 .expect("failed to build tokio runtime");
 
-            let mut core = match RuntimeCore::new(config) {
+            let core = match RuntimeCoreState::new(config) {
                 Ok(core) => {
                     let termination = core.termination_controller();
                     let inspector_info =
@@ -214,7 +1212,8 @@ pub fn spawn_runtime_thread(config: RuntimeConfig) -> RuntimeResult<SpawnRuntime
             };
 
             tokio_rt.block_on(async move {
-                core.run(cmd_rx).await;
+                let mut dispatcher = RuntimeDispatcher::new(core, cmd_rx);
+                dispatcher.run().await;
             });
         })
         .map_err(|e| RuntimeError::internal(format!("Failed to spawn runtime thread: {}", e)))?;
@@ -247,7 +1246,9 @@ impl InspectorRuntimeState {
     }
 }
 
-struct RuntimeCore {
+/// Core state that holds the V8 isolate and all runtime data.
+/// Owned directly by RuntimeDispatcher to enable job polling without RefCell borrows.
+struct RuntimeCoreState {
     js_runtime: JsRuntime,
     registry: PythonOpRegistry,
     module_loader: Rc<PythonModuleLoader>,
@@ -261,7 +1262,7 @@ struct RuntimeCore {
     inspector_state: Option<InspectorRuntimeState>,
 }
 
-impl RuntimeCore {
+impl RuntimeCoreState {
     fn new(config: RuntimeConfig) -> RuntimeResult<Self> {
         let registry = PythonOpRegistry::new();
         let extension = python_extension(registry.clone());
@@ -433,216 +1434,18 @@ impl RuntimeCore {
         self.termination.clone()
     }
 
-    async fn run(&mut self, mut rx: mpsc::UnboundedReceiver<RuntimeCommand>) {
-        while let Some(cmd) = rx.recv().await {
-            let mut break_loop = false;
-            match cmd {
-                RuntimeCommand::Eval { code, responder } => {
-                    if self.should_reject_new_work() {
-                        let _ = responder.send(Err(RuntimeError::terminated()));
-                        continue;
-                    }
-                    if let Err(err) = self.ensure_inspector_ready() {
-                        let _ = responder.send(Err(err));
-                        continue;
-                    }
-                    let watchdog = match self.start_sync_watchdog() {
-                        Ok(watchdog) => watchdog,
-                        Err(err) => {
-                            let _ = responder.send(Err(err));
-                            continue;
-                        }
-                    };
-                    let result = self.eval_sync(&code);
-                    let result = self.apply_watchdog_result(result, watchdog, "Sync evaluation");
-                    let _ = responder.send(result);
-                }
-                RuntimeCommand::EvalAsync {
-                    code,
-                    timeout_ms,
-                    task_locals,
-                    responder,
-                } => {
-                    if self.should_reject_new_work() {
-                        let _ = responder.send(Err(RuntimeError::terminated()));
-                        continue;
-                    }
-                    if let Err(err) = self.ensure_inspector_ready() {
-                        let _ = responder.send(Err(err));
-                        continue;
-                    }
-                    if let Some(ref locals) = task_locals {
-                        self.task_locals = Some(locals.clone());
-                        self.module_loader.set_task_locals(locals.clone());
-                        self.js_runtime
-                            .op_state()
-                            .borrow_mut()
-                            .put(crate::runtime::ops::GlobalTaskLocals(Some(locals.clone())));
-                    }
-                    let result = self.eval_async(code, timeout_ms).await;
-                    let _ = responder.send(result);
-                }
-                RuntimeCommand::RegisterPythonOp {
-                    name,
-                    mode,
-                    handler,
-                    responder,
-                } => {
-                    if self.should_reject_new_work() {
-                        let _ = responder.send(Err(RuntimeError::terminated()));
-                        continue;
-                    }
-                    let result = self.register_python_op(name, mode, handler);
-                    let _ = responder.send(result);
-                }
-                RuntimeCommand::SetModuleResolver { handler, responder } => {
-                    if self.should_reject_new_work() {
-                        let _ = responder.send(Err(RuntimeError::terminated()));
-                        continue;
-                    }
-                    self.module_loader.set_resolver(handler);
-                    if let Some(ref locals) = self.task_locals {
-                        self.module_loader.set_task_locals(locals.clone());
-                    }
-                    let _ = responder.send(Ok(()));
-                }
-                RuntimeCommand::SetModuleLoader { handler, responder } => {
-                    if self.should_reject_new_work() {
-                        let _ = responder.send(Err(RuntimeError::terminated()));
-                        continue;
-                    }
-                    self.module_loader.set_loader(handler);
-                    if let Some(ref locals) = self.task_locals {
-                        self.module_loader.set_task_locals(locals.clone());
-                    }
-                    let _ = responder.send(Ok(()));
-                }
-                RuntimeCommand::AddStaticModule {
-                    name,
-                    source,
-                    responder,
-                } => {
-                    if self.should_reject_new_work() {
-                        let _ = responder.send(Err(RuntimeError::terminated()));
-                        continue;
-                    }
-                    self.module_loader.add_static_module(name, source);
-                    let _ = responder.send(Ok(()));
-                }
-                RuntimeCommand::EvalModule {
-                    specifier,
-                    responder,
-                } => {
-                    if self.should_reject_new_work() {
-                        let _ = responder.send(Err(RuntimeError::terminated()));
-                        continue;
-                    }
-                    if let Err(err) = self.ensure_inspector_ready() {
-                        let _ = responder.send(Err(err));
-                        continue;
-                    }
-                    let watchdog = match self.start_sync_watchdog() {
-                        Ok(watchdog) => watchdog,
-                        Err(err) => {
-                            let _ = responder.send(Err(err));
-                            continue;
-                        }
-                    };
-                    let result = self.eval_module_sync(&specifier);
-                    let result =
-                        self.apply_watchdog_result(result, watchdog, "Sync module evaluation");
-                    let _ = responder.send(result);
-                }
-                RuntimeCommand::EvalModuleAsync {
-                    specifier,
-                    timeout_ms,
-                    task_locals,
-                    responder,
-                } => {
-                    if self.should_reject_new_work() {
-                        let _ = responder.send(Err(RuntimeError::terminated()));
-                        continue;
-                    }
-                    if let Err(err) = self.ensure_inspector_ready() {
-                        let _ = responder.send(Err(err));
-                        continue;
-                    }
-                    if let Some(ref locals) = task_locals {
-                        self.task_locals = Some(locals.clone());
-                        self.module_loader.set_task_locals(locals.clone());
-                        self.js_runtime
-                            .op_state()
-                            .borrow_mut()
-                            .put(crate::runtime::ops::GlobalTaskLocals(Some(locals.clone())));
-                    }
-                    let result = self.eval_module_async(specifier, timeout_ms).await;
-                    let _ = responder.send(result);
-                }
-                RuntimeCommand::CallFunctionAsync {
-                    fn_id,
-                    args,
-                    timeout_ms,
-                    task_locals,
-                    responder,
-                } => {
-                    if self.should_reject_new_work() {
-                        let _ = responder.send(Err(RuntimeError::terminated()));
-                        continue;
-                    }
-                    if let Err(err) = self.ensure_inspector_ready() {
-                        let _ = responder.send(Err(err));
-                        continue;
-                    }
-                    if let Some(ref locals) = task_locals {
-                        self.task_locals = Some(locals.clone());
-                        self.module_loader.set_task_locals(locals.clone());
-                        self.js_runtime
-                            .op_state()
-                            .borrow_mut()
-                            .put(crate::runtime::ops::GlobalTaskLocals(Some(locals.clone())));
-                    }
-                    let result = self.call_function_async(fn_id, args, timeout_ms).await;
-                    let _ = responder.send(result);
-                }
-                RuntimeCommand::ReleaseFunction { fn_id, responder } => {
-                    if self.should_reject_new_work() {
-                        let _ = responder.send(Err(RuntimeError::terminated()));
-                        continue;
-                    }
-                    let result = self.release_function(fn_id);
-                    let _ = responder.send(result);
-                }
-                RuntimeCommand::GetStats { responder } => {
-                    let result = self.collect_stats();
-                    let _ = responder.send(result);
-                }
-                RuntimeCommand::Terminate { responder } => {
-                    let result = self.finalize_termination();
-                    let _ = responder.send(result);
-                    break_loop = true;
-                }
-                RuntimeCommand::Shutdown { responder } => {
-                    let leaked_count = self.fn_registry.borrow().len();
-                    if leaked_count > 0 {
-                        eprintln!(
-                            "[jsrun] Warning: {} function handles not released before shutdown",
-                            leaked_count
-                        );
-                    }
-                    self.fn_registry.borrow_mut().clear();
-                    let _ = responder.send(());
-                    break_loop = true;
-                }
-            }
-            if break_loop {
-                rx.close();
-                break;
-            }
-        }
-    }
-
     fn should_reject_new_work(&self) -> bool {
         self.terminated || self.termination.is_requested()
+    }
+
+    /// Clear task locals after a job completes to prevent stale event loop references
+    fn clear_task_locals(&mut self) {
+        self.task_locals = None;
+        self.module_loader.clear_task_locals();
+        self.js_runtime
+            .op_state()
+            .borrow_mut()
+            .put(crate::runtime::ops::GlobalTaskLocals(None));
     }
 
     fn start_sync_watchdog(&self) -> RuntimeResult<Option<SyncWatchdog>> {
@@ -814,63 +1617,6 @@ impl RuntimeCore {
         })
     }
 
-    async fn eval_async(
-        &mut self,
-        code: String,
-        timeout_ms: Option<u64>,
-    ) -> RuntimeResult<JSValue> {
-        let start = Instant::now();
-        let result = self.eval_async_inner(code, timeout_ms).await;
-        let elapsed = start.elapsed();
-        self.stats_state.record(RuntimeCallKind::EvalAsync, elapsed);
-        result
-    }
-
-    async fn eval_async_inner(
-        &mut self,
-        code: String,
-        timeout_ms: Option<u64>,
-    ) -> RuntimeResult<JSValue> {
-        let timeout_ms = timeout_ms.or_else(|| {
-            self.execution_timeout.map(|duration| {
-                let millis = duration.as_millis();
-                if millis > u128::from(u64::MAX) {
-                    u64::MAX
-                } else {
-                    millis as u64
-                }
-            })
-        });
-
-        let global_value = self
-            .js_runtime
-            .execute_script("<eval_async>", code.clone())
-            .map_err(|err| self.translate_js_error(*err))?;
-
-        let resolve_future = self.js_runtime.resolve(global_value);
-        let poll_options = PollEventLoopOptions::default();
-
-        let resolved = if let Some(ms) = timeout_ms {
-            tokio::time::timeout(
-                Duration::from_millis(ms),
-                self.js_runtime
-                    .with_event_loop_promise(resolve_future, poll_options),
-            )
-            .await
-            .map_err(|_| RuntimeError::timeout(format!("Evaluation timed out after {}ms", ms)))?
-            .map_err(|err| self.translate_core_error(err))?
-        } else {
-            self.js_runtime
-                .with_event_loop_promise(resolve_future, poll_options)
-                .await
-                .map_err(|err| self.translate_core_error(err))?
-        };
-
-        let scope = &mut self.js_runtime.handle_scope();
-        let local = deno_core::v8::Local::new(scope, resolved);
-        Self::value_to_js_value(&self.fn_registry, &self.next_fn_id, scope, local)
-    }
-
     fn eval_module_sync(&mut self, specifier: &str) -> RuntimeResult<JSValue> {
         self.with_timing(RuntimeCallKind::EvalModuleSync, |this| {
             // Try to parse as absolute URL first, if it fails, resolve it as a bare specifier
@@ -932,221 +1678,6 @@ impl RuntimeCore {
             let local = deno_core::v8::Local::new(scope, module_namespace);
             Self::value_to_js_value(&this.fn_registry, &this.next_fn_id, scope, local.into())
         })
-    }
-
-    async fn eval_module_async(
-        &mut self,
-        specifier: String,
-        timeout_ms: Option<u64>,
-    ) -> RuntimeResult<JSValue> {
-        let start = Instant::now();
-        let result = self.eval_module_async_inner(specifier, timeout_ms).await;
-        let elapsed = start.elapsed();
-        self.stats_state
-            .record(RuntimeCallKind::EvalModuleAsync, elapsed);
-        result
-    }
-
-    async fn eval_module_async_inner(
-        &mut self,
-        specifier: String,
-        timeout_ms: Option<u64>,
-    ) -> RuntimeResult<JSValue> {
-        let timeout_ms = timeout_ms.or_else(|| {
-            self.execution_timeout.map(|duration| {
-                let millis = duration.as_millis();
-                if millis > u128::from(u64::MAX) {
-                    u64::MAX
-                } else {
-                    millis as u64
-                }
-            })
-        });
-
-        // Try to parse as absolute URL first, if it fails, resolve it as a bare specifier
-        let module_specifier = if specifier.contains(':') || specifier.starts_with('/') {
-            // Already a URL or absolute path
-            deno_core::ModuleSpecifier::parse(&specifier).map_err(|e| {
-                RuntimeError::internal(format!("Invalid module specifier '{}': {}", specifier, e))
-            })?
-        } else {
-            // Bare specifier - resolve relative to a synthetic base
-            let base = deno_core::ModuleSpecifier::parse("jsrun://runtime/")
-                .map_err(|e| RuntimeError::internal(format!("Failed to create base URL: {}", e)))?;
-            base.join(&specifier).map_err(|e| {
-                RuntimeError::internal(format!(
-                    "Failed to resolve module specifier '{}': {}",
-                    specifier, e
-                ))
-            })?
-        };
-
-        // Load the module
-        let module_id = self
-            .js_runtime
-            .load_main_es_module(&module_specifier)
-            .await
-            .map_err(|e| {
-                RuntimeError::internal(format!("Failed to load module '{}': {}", specifier, e))
-            })?;
-
-        // Evaluate the module
-        let receiver = self.js_runtime.mod_evaluate(module_id);
-
-        // Poll the runtime until the module evaluation completes
-        let poll_options = PollEventLoopOptions::default();
-
-        if let Some(ms) = timeout_ms {
-            tokio::time::timeout(
-                Duration::from_millis(ms),
-                self.js_runtime.run_event_loop(poll_options),
-            )
-            .await
-            .map_err(|_| {
-                RuntimeError::timeout(format!("Module evaluation timed out after {}ms", ms))
-            })?
-            .map_err(|err| self.translate_core_error(err))?
-        } else {
-            self.js_runtime
-                .run_event_loop(poll_options)
-                .await
-                .map_err(|err| self.translate_core_error(err))?
-        };
-
-        // Wait for the evaluation result - receiver returns Result<(), CoreError>
-        let eval_result = receiver.await;
-
-        // Check if evaluation succeeded
-        if let Err(err) = eval_result {
-            return Err(self.translate_core_error(err));
-        }
-
-        // Get the module namespace - must call get_module_namespace before handle_scope
-        let module_namespace = self
-            .js_runtime
-            .get_module_namespace(module_id)
-            .map_err(|e| {
-                RuntimeError::internal(format!("Failed to get module namespace: {}", e))
-            })?;
-        let scope = &mut self.js_runtime.handle_scope();
-        let local = deno_core::v8::Local::new(scope, module_namespace);
-        Self::value_to_js_value(&self.fn_registry, &self.next_fn_id, scope, local.into())
-    }
-
-    /// Execute a stored JavaScript function by id with the provided arguments.
-    async fn call_function_async(
-        &mut self,
-        fn_id: u32,
-        args: Vec<JSValue>,
-        timeout_ms: Option<u64>,
-    ) -> RuntimeResult<JSValue> {
-        let start = Instant::now();
-        let result = self
-            .call_function_async_inner(fn_id, args, timeout_ms)
-            .await;
-        let elapsed = start.elapsed();
-        self.stats_state
-            .record(RuntimeCallKind::CallFunctionAsync, elapsed);
-        result
-    }
-
-    async fn call_function_async_inner(
-        &mut self,
-        fn_id: u32,
-        args: Vec<JSValue>,
-        timeout_ms: Option<u64>,
-    ) -> RuntimeResult<JSValue> {
-        // Determine timeout
-        let timeout_ms = timeout_ms.or_else(|| {
-            self.execution_timeout.map(|duration| {
-                let millis = duration.as_millis();
-                if millis > u128::from(u64::MAX) {
-                    u64::MAX
-                } else {
-                    millis as u64
-                }
-            })
-        });
-
-        // Look up function in registry and call it
-        let result_global: Result<
-            Result<deno_core::v8::Global<deno_core::v8::Value>, JsError>,
-            RuntimeError,
-        > = {
-            let scope = &mut self.js_runtime.handle_scope();
-            let mut try_catch = v8::TryCatch::new(scope);
-
-            let (func, receiver) = {
-                let registry = self.fn_registry.borrow();
-                let stored = registry.get(&fn_id).ok_or_else(|| {
-                    RuntimeError::internal(format!("Function ID {} not found", fn_id))
-                })?;
-                let func = deno_core::v8::Local::new(&mut try_catch, &stored.function);
-                let receiver = stored
-                    .receiver
-                    .as_ref()
-                    .map(|r| deno_core::v8::Local::new(&mut try_catch, r));
-                (func, receiver)
-            };
-
-            // Convert arguments from JSValue to v8::Value
-            let mut v8_args = Vec::with_capacity(args.len());
-            for arg in &args {
-                let v8_val = Self::js_value_to_v8(&self.fn_registry, &mut try_catch, arg)?;
-                v8_args.push(v8_val);
-            }
-
-            let call_receiver = receiver.unwrap_or_else(|| {
-                try_catch
-                    .get_current_context()
-                    .global(&mut try_catch)
-                    .into()
-            });
-
-            // Call the function
-            match func.call(&mut try_catch, call_receiver, &v8_args) {
-                Some(value) => Ok(Ok(deno_core::v8::Global::new(&mut try_catch, value))),
-                None => match try_catch.exception() {
-                    Some(exception) => {
-                        let js_error = JsError::from_v8_exception(&mut try_catch, exception);
-                        Ok(Err(*js_error))
-                    }
-                    None => Err(RuntimeError::internal("Function call failed")),
-                },
-            }
-            // scope and try_catch dropped here
-        };
-
-        let result_global = match result_global {
-            Ok(Ok(global)) => global,
-            Ok(Err(js_error)) => return Err(self.translate_js_error(js_error)),
-            Err(err) => return Err(err),
-        };
-
-        // Resolve promises (reuse eval_async pattern)
-        let resolve_future = self.js_runtime.resolve(result_global);
-        let poll_options = PollEventLoopOptions::default();
-
-        let resolved = if let Some(ms) = timeout_ms {
-            tokio::time::timeout(
-                Duration::from_millis(ms),
-                self.js_runtime
-                    .with_event_loop_promise(resolve_future, poll_options),
-            )
-            .await
-            .map_err(|_| RuntimeError::timeout(format!("Function call timed out after {}ms", ms)))?
-            .map_err(|err| self.translate_core_error(err))?
-        } else {
-            self.js_runtime
-                .with_event_loop_promise(resolve_future, poll_options)
-                .await
-                .map_err(|err| self.translate_core_error(err))?
-        };
-
-        // Convert back to JSValue
-        let scope = &mut self.js_runtime.handle_scope();
-        let local = deno_core::v8::Local::new(scope, resolved);
-        Self::value_to_js_value(&self.fn_registry, &self.next_fn_id, scope, local)
     }
 
     /// Remove a function from the registry, freeing its V8 global handle.
