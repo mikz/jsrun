@@ -3,6 +3,7 @@
 //! This module defines the configuration structure for JavaScript runtimes,
 //! including heap limits and bootstrap options.
 
+use crate::runtime::js_value::{SerializationLimits, MAX_JS_BYTES, MAX_JS_DEPTH};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use std::net::SocketAddr;
@@ -69,6 +70,7 @@ impl InspectorConfig {
         target_url = None,
         display_name = None,
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         host: &str,
         port: u16,
@@ -179,6 +181,12 @@ pub struct RuntimeConfig {
 
     /// Startup snapshot bytes.
     pub snapshot: Option<Vec<u8>>,
+
+    /// Maximum serialization depth for Python<->JS value transfers.
+    pub max_serialization_depth: usize,
+
+    /// Maximum serialized byte size for Python<->JS value transfers.
+    pub max_serialization_bytes: usize,
 }
 
 impl Default for RuntimeConfig {
@@ -191,6 +199,8 @@ impl Default for RuntimeConfig {
             enable_console: Some(true),
             inspector: None,
             snapshot: None,
+            max_serialization_depth: MAX_JS_DEPTH,
+            max_serialization_bytes: MAX_JS_BYTES,
         }
     }
 }
@@ -247,6 +257,28 @@ impl RuntimeConfig {
             ))
         }
     }
+
+    pub fn serialization_limits(&self) -> SerializationLimits {
+        SerializationLimits::new(self.max_serialization_depth, self.max_serialization_bytes)
+    }
+}
+
+fn validate_serialization_depth(depth: usize) -> PyResult<()> {
+    if depth == 0 {
+        return Err(PyValueError::new_err(
+            "max_serialization_depth must be a positive integer",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_serialization_bytes(bytes: usize) -> PyResult<()> {
+    if bytes == 0 {
+        return Err(PyValueError::new_err(
+            "max_serialization_bytes must be a positive integer",
+        ));
+    }
+    Ok(())
 }
 
 #[pymethods]
@@ -261,7 +293,10 @@ impl RuntimeConfig {
         enable_console = Some(true),
         inspector = None,
         snapshot = None,
+        max_serialization_depth = None,
+        max_serialization_bytes = None,
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         max_heap_size: Option<usize>,
         initial_heap_size: Option<usize>,
@@ -270,6 +305,8 @@ impl RuntimeConfig {
         enable_console: Option<bool>,
         inspector: Option<InspectorConfig>,
         snapshot: Option<&Bound<'_, PyAny>>,
+        max_serialization_depth: Option<usize>,
+        max_serialization_bytes: Option<usize>,
     ) -> PyResult<Self> {
         if bootstrap.is_some() && snapshot.is_some() {
             return Err(PyValueError::new_err(
@@ -314,6 +351,16 @@ impl RuntimeConfig {
                 return Err(PyValueError::new_err("Snapshot bytes cannot be empty"));
             }
             config.snapshot = Some(bytes);
+        }
+
+        if let Some(depth) = max_serialization_depth {
+            validate_serialization_depth(depth)?;
+            config.max_serialization_depth = depth;
+        }
+
+        if let Some(bytes) = max_serialization_bytes {
+            validate_serialization_bytes(bytes)?;
+            config.max_serialization_bytes = bytes;
         }
 
         Ok(config)
@@ -422,6 +469,34 @@ impl RuntimeConfig {
         Ok(())
     }
 
+    /// Maximum serialization depth for Python<->JS transfers.
+    #[getter]
+    fn max_serialization_depth(&self) -> usize {
+        self.max_serialization_depth
+    }
+
+    /// Set maximum serialization depth for Python<->JS transfers.
+    #[setter]
+    fn set_max_serialization_depth(&mut self, depth: usize) -> PyResult<()> {
+        validate_serialization_depth(depth)?;
+        self.max_serialization_depth = depth;
+        Ok(())
+    }
+
+    /// Maximum serialized byte size for Python<->JS transfers.
+    #[getter]
+    fn max_serialization_bytes(&self) -> usize {
+        self.max_serialization_bytes
+    }
+
+    /// Set maximum serialized byte size for Python<->JS transfers.
+    #[setter]
+    fn set_max_serialization_bytes(&mut self, bytes: usize) -> PyResult<()> {
+        validate_serialization_bytes(bytes)?;
+        self.max_serialization_bytes = bytes;
+        Ok(())
+    }
+
     fn __repr__(&self) -> String {
         format!("RuntimeConfig({:?})", self)
     }
@@ -443,6 +518,8 @@ mod tests {
         assert_eq!(config.enable_console, Some(true));
         assert!(config.inspector.is_none());
         assert!(config.snapshot.is_none());
+        assert_eq!(config.max_serialization_depth, MAX_JS_DEPTH);
+        assert_eq!(config.max_serialization_bytes, MAX_JS_BYTES);
     }
 
     #[allow(clippy::field_reassign_with_default)]

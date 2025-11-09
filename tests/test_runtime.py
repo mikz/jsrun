@@ -571,6 +571,43 @@ class TestRuntimeConversions:
         finally:
             runtime.close()
 
+    def test_python_to_js_respects_serialization_bytes_limit(self):
+        config = RuntimeConfig(max_serialization_bytes=32)
+        with Runtime(config) as runtime:
+            identity = runtime.eval("(value) => value")
+            payload = "abcdefghij" * 4  # 40 bytes
+            with pytest.raises(
+                RuntimeError, match=r"String size limit exceeded: \d+ > \d+"
+            ):
+                identity(payload)
+
+    def test_python_to_js_respects_serialization_depth_limit(self):
+        config = RuntimeConfig(max_serialization_depth=1)
+        with Runtime(config) as runtime:
+            identity = runtime.eval("(value) => value")
+            nested = [[1]]
+            with pytest.raises(
+                RuntimeError, match=r"Depth exceeded maximum limit of \d+"
+            ):
+                identity(nested)
+
+    def test_js_to_python_respects_serialization_bytes_limit(self):
+        config = RuntimeConfig(max_serialization_bytes=32)
+        with Runtime(config) as runtime:
+            with pytest.raises(
+                RuntimeError,
+                match=r"Size \(\d+ bytes\) exceeded maximum limit of \d+ bytes",
+            ):
+                runtime.eval("'x'.repeat(64)")
+
+    def test_js_to_python_respects_serialization_depth_limit(self):
+        config = RuntimeConfig(max_serialization_depth=2)
+        with Runtime(config) as runtime:
+            with pytest.raises(
+                RuntimeError, match=r"Depth exceeded maximum limit of \d+"
+            ):
+                runtime.eval("({a: {b: {c: 1}}})")
+
 
 class TestRuntimeBindings:
     """Tests for the decorator-style binding helper."""
@@ -1147,6 +1184,34 @@ class TestRuntimeConfig:
         assert config.initial_heap_size == 50 * 1024 * 1024
         assert config.bootstrap == 'console.log("Bootstrap executed")'
         assert config.timeout == 30.0
+
+    def test_runtime_config_serialization_kwargs(self):
+        """RuntimeConfig should accept serialization limits via kwargs."""
+        from jsrun import RuntimeConfig
+
+        config = RuntimeConfig(
+            max_serialization_depth=200,
+            max_serialization_bytes=2048,
+        )
+
+        assert config.max_serialization_depth == 200
+        assert config.max_serialization_bytes == 2048
+
+    def test_runtime_config_serialization_setters(self):
+        """Serialization limit setters should validate values."""
+        from jsrun import RuntimeConfig
+
+        config = RuntimeConfig()
+        config.max_serialization_depth = 128
+        config.max_serialization_bytes = 4096
+
+        assert config.max_serialization_depth == 128
+        assert config.max_serialization_bytes == 4096
+
+        with pytest.raises(ValueError, match="positive integer"):
+            config.max_serialization_depth = 0
+        with pytest.raises(ValueError, match="positive integer"):
+            config.max_serialization_bytes = 0
 
     def test_runtime_config_with_bootstrap(self):
         """Test Runtime with bootstrap script."""

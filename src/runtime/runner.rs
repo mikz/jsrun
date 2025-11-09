@@ -10,7 +10,7 @@ use crate::runtime::inspector::{
     InspectorConnectionState, InspectorMetadata, InspectorRegistration,
     InspectorRegistrationParams, InspectorServer,
 };
-use crate::runtime::js_value::{JSValue, LimitTracker, MAX_JS_BYTES, MAX_JS_DEPTH};
+use crate::runtime::js_value::{JSValue, LimitTracker, SerializationLimits};
 use crate::runtime::loader::PythonModuleLoader;
 use crate::runtime::ops::{python_extension, PythonOpMode, PythonOpRegistry};
 use crate::runtime::stats::{
@@ -883,15 +883,19 @@ impl RuntimeJob for EvalAsyncJob {
                     }
                     v8::PromiseState::Fulfilled => {
                         // Promise resolved successfully
+                        let fn_registry = core.fn_registry.clone();
+                        let next_fn_id = core.next_fn_id.clone();
+                        let limits = core.serialization_limits;
                         let scope = &mut core.js_runtime.handle_scope();
                         let promise_local: v8::Local<v8::Promise> =
                             v8::Local::new(scope, &*promise);
                         let result_value = promise_local.result(scope);
                         let result = RuntimeCoreState::value_to_js_value(
-                            &core.fn_registry,
-                            &core.next_fn_id,
+                            &fn_registry,
+                            &next_fn_id,
                             scope,
                             result_value,
+                            limits,
                         );
                         self.state = EvalAsyncJobState::Done;
                         Poll::Ready(result)
@@ -1090,6 +1094,9 @@ impl RuntimeJob for EvalModuleAsyncJob {
             }
             EvalModuleAsyncJobState::WaitingNamespace { module_id } => {
                 // Extract module namespace
+                let fn_registry = core.fn_registry.clone();
+                let next_fn_id = core.next_fn_id.clone();
+                let limits = core.serialization_limits;
                 let module_namespace =
                     core.js_runtime
                         .get_module_namespace(*module_id)
@@ -1099,11 +1106,13 @@ impl RuntimeJob for EvalModuleAsyncJob {
 
                 let scope = &mut core.js_runtime.handle_scope();
                 let local = deno_core::v8::Local::new(scope, module_namespace);
+                let value: v8::Local<'_, v8::Value> = local.into();
                 let result = RuntimeCoreState::value_to_js_value(
-                    &core.fn_registry,
-                    &core.next_fn_id,
+                    &fn_registry,
+                    &next_fn_id,
                     scope,
-                    local.into(),
+                    value,
+                    limits,
                 );
 
                 self.state = EvalModuleAsyncJobState::Done;
@@ -1315,15 +1324,19 @@ impl RuntimeJob for CallFunctionAsyncJob {
                 match promise_state {
                     v8::PromiseState::Pending => Poll::Pending,
                     v8::PromiseState::Fulfilled => {
+                        let fn_registry = core.fn_registry.clone();
+                        let next_fn_id = core.next_fn_id.clone();
+                        let limits = core.serialization_limits;
                         let scope = &mut core.js_runtime.handle_scope();
                         let promise_local: v8::Local<v8::Promise> =
                             v8::Local::new(scope, &*promise);
                         let result_value = promise_local.result(scope);
                         let result = RuntimeCoreState::value_to_js_value(
-                            &core.fn_registry,
-                            &core.next_fn_id,
+                            &fn_registry,
+                            &next_fn_id,
                             scope,
                             result_value,
+                            limits,
                         );
                         self.state = CallFunctionAsyncJobState::Done;
                         Poll::Ready(result)
@@ -1434,15 +1447,19 @@ impl RuntimeJob for ResumeFunctionCallJob {
                     return match promise_state {
                         v8::PromiseState::Pending => Poll::Pending,
                         v8::PromiseState::Fulfilled => {
+                            let fn_registry = core.fn_registry.clone();
+                            let next_fn_id = core.next_fn_id.clone();
+                            let limits = core.serialization_limits;
                             let scope = &mut core.js_runtime.handle_scope();
                             let promise_local: v8::Local<v8::Promise> =
                                 v8::Local::new(scope, &self.promise);
                             let result_value = promise_local.result(scope);
                             let result = RuntimeCoreState::value_to_js_value(
-                                &core.fn_registry,
-                                &core.next_fn_id,
+                                &fn_registry,
+                                &next_fn_id,
                                 scope,
                                 result_value,
+                                limits,
                             );
                             self.state = ResumeFunctionCallJobState::Done;
                             Poll::Ready(result)
@@ -1564,6 +1581,7 @@ struct RuntimeCoreState {
     inspector_state: Option<InspectorRuntimeState>,
     #[allow(dead_code)]
     startup_snapshot: Option<SnapshotSource>,
+    serialization_limits: SerializationLimits,
 }
 
 impl RuntimeCoreState {
@@ -1580,6 +1598,8 @@ impl RuntimeCoreState {
             enable_console,
             inspector,
             snapshot,
+            max_serialization_depth,
+            max_serialization_bytes,
         } = config;
 
         if initial_heap_size.is_some() && max_heap_size.is_none() {
@@ -1604,6 +1624,9 @@ impl RuntimeCoreState {
             }
             (None, _) => None,
         };
+
+        let serialization_limits =
+            SerializationLimits::new(max_serialization_depth, max_serialization_bytes);
 
         let mut snapshot_source = snapshot.map(SnapshotSource::from_vec);
         let startup_snapshot = snapshot_source.as_mut().map(|source| source.as_static());
@@ -1651,6 +1674,11 @@ impl RuntimeCoreState {
             js_runtime
                 .execute_script("<bootstrap>", script)
                 .map_err(|err| RuntimeError::javascript(JsExceptionDetails::from_js_error(*err)))?;
+        }
+
+        {
+            let state = js_runtime.op_state();
+            state.borrow_mut().put(serialization_limits);
         }
 
         let termination = {
@@ -1710,6 +1738,7 @@ impl RuntimeCoreState {
             terminated: false,
             inspector_state,
             startup_snapshot: snapshot_source,
+            serialization_limits,
         })
     }
 
@@ -1968,9 +1997,12 @@ impl RuntimeCoreState {
                 .execute_script("<eval>", code.to_string())
                 .map_err(|err| this.translate_js_error(*err))?;
 
+            let fn_registry = this.fn_registry.clone();
+            let next_fn_id = this.next_fn_id.clone();
             let scope = &mut this.js_runtime.handle_scope();
             let local = deno_core::v8::Local::new(scope, global_value);
-            Self::value_to_js_value(&this.fn_registry, &this.next_fn_id, scope, local)
+            let limits = this.serialization_limits;
+            Self::value_to_js_value(&fn_registry, &next_fn_id, scope, local, limits)
         })
     }
 
@@ -2031,9 +2063,14 @@ impl RuntimeCoreState {
                     .map_err(|e| {
                         RuntimeError::internal(format!("Failed to get module namespace: {}", e))
                     })?;
+            let fn_registry = this.fn_registry.clone();
+            let next_fn_id = this.next_fn_id.clone();
             let scope = &mut this.js_runtime.handle_scope();
-            let local = deno_core::v8::Local::new(scope, module_namespace);
-            Self::value_to_js_value(&this.fn_registry, &this.next_fn_id, scope, local.into())
+            let namespace_obj = deno_core::v8::Local::new(scope, module_namespace);
+            let limits = this.serialization_limits;
+            let namespace_value: deno_core::v8::Local<'_, deno_core::v8::Value> =
+                namespace_obj.into();
+            Self::value_to_js_value(&fn_registry, &next_fn_id, scope, namespace_value, limits)
         })
     }
 
@@ -2065,6 +2102,10 @@ impl RuntimeCoreState {
         let effective_timeout = self.effective_timeout_ms(timeout_ms);
         let deadline = effective_timeout.map(|ms| start_time + Duration::from_millis(ms));
 
+        let fn_registry = self.fn_registry.clone();
+        let next_fn_id = self.next_fn_id.clone();
+        let limits = self.serialization_limits;
+
         enum SyncCallOutcome {
             Immediate(JSValue),
             Pending(v8::Global<v8::Promise>),
@@ -2092,9 +2133,8 @@ impl RuntimeCoreState {
 
             let mut v8_args = Vec::with_capacity(args.len());
             for arg in &args {
-                let v8_val =
-                    RuntimeCoreState::js_value_to_v8(&self.fn_registry, &mut try_catch, arg)
-                        .map_err(SyncCallError::Runtime)?;
+                let v8_val = RuntimeCoreState::js_value_to_v8(&fn_registry, &mut try_catch, arg)
+                    .map_err(SyncCallError::Runtime)?;
                 v8_args.push(v8_val);
             }
 
@@ -2125,10 +2165,11 @@ impl RuntimeCoreState {
                             v8::PromiseState::Fulfilled => {
                                 let fulfilled_value = promise.result(&mut try_catch);
                                 RuntimeCoreState::value_to_js_value(
-                                    &self.fn_registry,
-                                    &self.next_fn_id,
+                                    &fn_registry,
+                                    &next_fn_id,
                                     &mut try_catch,
                                     fulfilled_value,
+                                    limits,
                                 )
                                 .map(SyncCallOutcome::Immediate)
                                 .map_err(SyncCallError::Runtime)
@@ -2142,10 +2183,11 @@ impl RuntimeCoreState {
                         }
                     } else {
                         RuntimeCoreState::value_to_js_value(
-                            &self.fn_registry,
-                            &self.next_fn_id,
+                            &fn_registry,
+                            &next_fn_id,
                             &mut try_catch,
                             result_value,
+                            limits,
                         )
                         .map(SyncCallOutcome::Immediate)
                         .map_err(SyncCallError::Runtime)
@@ -2215,9 +2257,10 @@ impl RuntimeCoreState {
         next_fn_id: &Rc<RefCell<u32>>,
         scope: &mut deno_core::v8::HandleScope<'s>,
         value: deno_core::v8::Local<'s, deno_core::v8::Value>,
+        limits: SerializationLimits,
     ) -> RuntimeResult<JSValue> {
         let mut seen = HashSet::new();
-        let mut tracker = LimitTracker::new(MAX_JS_DEPTH, MAX_JS_BYTES);
+        let mut tracker = LimitTracker::new(limits.max_depth, limits.max_bytes);
         Self::value_to_js_value_internal(
             fn_registry,
             next_fn_id,

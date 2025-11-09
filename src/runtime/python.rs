@@ -5,7 +5,7 @@ use super::conversion::{js_value_to_python, python_to_js_value};
 use super::error::{JsExceptionDetails, RuntimeError, RuntimeResult};
 use super::handle::RuntimeHandle;
 use super::inspector::InspectorMetadata;
-use super::js_value::JSValue;
+use super::js_value::{JSValue, SerializationLimits};
 use super::ops::PythonOpMode;
 use super::runner::{self, FunctionCallResult};
 use super::snapshot::{SnapshotBuilder, SnapshotBuilderConfig};
@@ -914,6 +914,7 @@ impl Runtime {
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("Runtime has been closed"))?
             .clone();
+        let serialization_limits = handle.serialization_limits();
 
         let obj_bound = obj.clone();
         let dict = obj_bound
@@ -952,7 +953,7 @@ impl Runtime {
                     "target[{key_literal}] = (...args) => {bridge_name}({op_id}, ...args);"
                 ));
             } else {
-                let js_value = python_to_js_value(value)?;
+                let js_value = python_to_js_value(value, &serialization_limits)?;
                 let literal = js_value_to_js_expression(&js_value)?;
                 assignments.push(format!("target[{key_literal}] = {literal};"));
             }
@@ -1094,16 +1095,23 @@ pub struct JsFunction {
     handle: std::cell::RefCell<Option<RuntimeHandle>>,
     fn_id: u32,
     closed: std::cell::Cell<bool>,
+    serialization_limits: SerializationLimits,
 }
 
 impl JsFunction {
-    pub fn new(py: Python<'_>, handle: RuntimeHandle, fn_id: u32) -> PyResult<Py<Self>> {
+    pub fn new(
+        py: Python<'_>,
+        handle: RuntimeHandle,
+        fn_id: u32,
+        serialization_limits: SerializationLimits,
+    ) -> PyResult<Py<Self>> {
         handle.track_function_id(fn_id);
         let finalizer_handle = handle.clone();
         let instance = Self {
             handle: std::cell::RefCell::new(Some(handle)),
             fn_id,
             closed: std::cell::Cell::new(false),
+            serialization_limits,
         };
         let py_obj = Py::new(py, instance)?;
         Self::attach_finalizer(py, &py_obj, finalizer_handle, fn_id)?;
@@ -1149,10 +1157,16 @@ impl JsFunction {
         Ok(())
     }
 
-    fn convert_python_args(args: &Bound<'_, pyo3::types::PyTuple>) -> PyResult<Vec<JSValue>> {
+    fn convert_python_args(
+        &self,
+        args: &Bound<'_, pyo3::types::PyTuple>,
+    ) -> PyResult<Vec<JSValue>> {
         let mut js_args = Vec::with_capacity(args.len());
         for arg in args.iter() {
-            js_args.push(super::conversion::python_to_js_value(arg)?);
+            js_args.push(super::conversion::python_to_js_value(
+                arg,
+                &self.serialization_limits,
+            )?);
         }
         Ok(js_args)
     }
@@ -1190,7 +1204,7 @@ impl JsFunction {
 
         let fn_id = self.fn_id;
 
-        let js_args = Self::convert_python_args(args)?;
+        let js_args = self.convert_python_args(args)?;
         let timeout_ms = normalize_timeout_to_ms(timeout)?;
 
         let call_result = handle
@@ -1240,7 +1254,7 @@ impl JsFunction {
             .clone();
 
         let fn_id = self.fn_id;
-        let js_args = Self::convert_python_args(args)?;
+        let js_args = self.convert_python_args(args)?;
         let timeout_ms = normalize_timeout_to_ms(timeout)?;
 
         let task_locals = pyo3_tokio::get_current_locals(py)?;

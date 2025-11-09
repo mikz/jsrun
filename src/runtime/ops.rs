@@ -6,7 +6,7 @@
 //! identified by an integer op id.
 
 use crate::runtime::conversion::{js_value_to_python, python_to_js_value};
-use crate::runtime::js_value::JSValue;
+use crate::runtime::js_value::{JSValue, SerializationLimits};
 use deno_core::ascii_str;
 use deno_core::op2;
 use deno_core::Extension;
@@ -121,6 +121,10 @@ fn op_jsrun_call_python_sync(
         )));
     }
 
+    let serialization_limits = *state
+        .try_borrow::<SerializationLimits>()
+        .ok_or_else(|| JsErrorBox::type_error("Serialization limits not configured"))?;
+
     Python::attach(|py| -> Result<JSValue, JsErrorBox> {
         let py_args = args
             .iter()
@@ -131,7 +135,7 @@ fn op_jsrun_call_python_sync(
             .handler
             .call(py, py_args_tuple, None)
             .map_err(map_pyerr)?;
-        python_to_js_value(result.into_bound(py)).map_err(map_pyerr)
+        python_to_js_value(result.into_bound(py), &serialization_limits).map_err(map_pyerr)
     })
 }
 
@@ -155,6 +159,10 @@ fn op_jsrun_call_python_async(
         .try_borrow::<GlobalTaskLocals>()
         .ok_or_else(|| JsErrorBox::type_error("GlobalTaskLocals not found in OpState"))?
         .clone();
+
+    let serialization_limits = *state
+        .try_borrow::<SerializationLimits>()
+        .ok_or_else(|| JsErrorBox::type_error("Serialization limits not configured"))?;
 
     let coroutine = Python::attach(|py| -> Result<Py<PyAny>, JsErrorBox> {
         let py_args = args
@@ -196,7 +204,9 @@ fn op_jsrun_call_python_async(
             .await
             .map_err(|err| JsErrorBox::type_error(format!("Python coroutine failed: {}", err)))?;
 
-        Python::attach(|py| python_to_js_value(result.into_bound(py)).map_err(map_pyerr))
+        Python::attach(|py| {
+            python_to_js_value(result.into_bound(py), &serialization_limits).map_err(map_pyerr)
+        })
     })
 }
 

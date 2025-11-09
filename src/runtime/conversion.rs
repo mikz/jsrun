@@ -1,6 +1,6 @@
 //! Conversion helpers between Python objects and JSValue/serde_json values.
 
-use crate::runtime::js_value::{JSValue, LimitTracker, MAX_JS_BYTES, MAX_JS_DEPTH};
+use crate::runtime::js_value::{JSValue, LimitTracker, SerializationLimits};
 use crate::runtime::python::runtime_error_to_py;
 use indexmap::IndexMap;
 use num_bigint::BigInt;
@@ -130,7 +130,12 @@ pub(crate) fn js_value_to_python(
                 PyRuntimeError::new_err("RuntimeHandle required to convert JSValue::Function")
             })?;
 
-            let js_fn = super::python::JsFunction::new(py, handle.clone(), *id)?;
+            let js_fn = super::python::JsFunction::new(
+                py,
+                handle.clone(),
+                *id,
+                handle.serialization_limits(),
+            )?;
             Ok(js_fn.into_any())
         }
     }
@@ -139,10 +144,13 @@ pub(crate) fn js_value_to_python(
 /// Convert a Python object into a JSValue.
 ///
 /// This is used by the ops system to convert Python handler arguments to JSValue.
-pub(crate) fn python_to_js_value(obj: Bound<'_, PyAny>) -> PyResult<JSValue> {
+pub(crate) fn python_to_js_value(
+    obj: Bound<'_, PyAny>,
+    limits: &SerializationLimits,
+) -> PyResult<JSValue> {
     let mut seen: HashSet<usize> = HashSet::new();
-    let mut tracker = LimitTracker::new(MAX_JS_DEPTH, MAX_JS_BYTES);
-    python_to_js_value_internal(obj, 0, &mut seen, &mut tracker)
+    let mut tracker = LimitTracker::new(limits.max_depth, limits.max_bytes);
+    python_to_js_value_internal(obj, 0, &mut seen, &mut tracker, limits)
 }
 
 fn python_to_js_value_internal(
@@ -150,11 +158,12 @@ fn python_to_js_value_internal(
     depth: usize,
     seen: &mut HashSet<usize>,
     tracker: &mut LimitTracker,
+    limits: &SerializationLimits,
 ) -> PyResult<JSValue> {
-    if depth > MAX_JS_DEPTH {
+    if depth > limits.max_depth {
         return Err(PyRuntimeError::new_err(format!(
             "Depth limit exceeded: {} > {}",
-            depth, MAX_JS_DEPTH
+            depth, limits.max_depth
         )));
     }
 
@@ -204,7 +213,13 @@ fn python_to_js_value_internal(
 
         let mut items = Vec::with_capacity(list.len());
         for item in list.iter() {
-            items.push(python_to_js_value_internal(item, depth + 1, seen, tracker)?);
+            items.push(python_to_js_value_internal(
+                item,
+                depth + 1,
+                seen,
+                tracker,
+                limits,
+            )?);
         }
         seen.remove(&ptr);
         Ok(JSValue::Array(items))
@@ -229,7 +244,7 @@ fn python_to_js_value_internal(
             add_bytes(8, tracker)?;
             map.insert(
                 key_str,
-                python_to_js_value_internal(value, depth + 1, seen, tracker)?,
+                python_to_js_value_internal(value, depth + 1, seen, tracker, limits)?,
             );
         }
         seen.remove(&ptr);
@@ -250,7 +265,13 @@ fn python_to_js_value_internal(
 
         let mut items = Vec::with_capacity(py_set.len());
         for item in py_set.iter() {
-            items.push(python_to_js_value_internal(item, depth + 1, seen, tracker)?);
+            items.push(python_to_js_value_internal(
+                item,
+                depth + 1,
+                seen,
+                tracker,
+                limits,
+            )?);
         }
         seen.remove(&ptr);
         Ok(JSValue::Set(items))
@@ -272,7 +293,13 @@ fn python_to_js_value_internal(
 
         let mut items = Vec::with_capacity(py_frozenset.len());
         for item in py_frozenset.iter() {
-            items.push(python_to_js_value_internal(item, depth + 1, seen, tracker)?);
+            items.push(python_to_js_value_internal(
+                item,
+                depth + 1,
+                seen,
+                tracker,
+                limits,
+            )?);
         }
         seen.remove(&ptr);
         Ok(JSValue::Set(items))
@@ -321,11 +348,11 @@ fn python_to_js_value_internal(
         add_bytes(std::mem::size_of::<f64>(), tracker)?;
         Ok(JSValue::Float(f))
     } else if let Ok(s) = obj.extract::<String>() {
-        if s.len() > MAX_JS_BYTES {
+        if s.len() > limits.max_bytes {
             return Err(PyRuntimeError::new_err(format!(
                 "String size limit exceeded: {} > {}",
                 s.len(),
-                MAX_JS_BYTES
+                limits.max_bytes
             )));
         }
         add_bytes(s.len(), tracker)?;

@@ -16,6 +16,28 @@ pub const MAX_JS_DEPTH: usize = 100;
 /// Maximum size in bytes for JavaScript value serialization
 pub const MAX_JS_BYTES: usize = 10 * 1024 * 1024; // 10MB
 
+/// Configurable serialization limits applied during Python<->JS transfers.
+#[derive(Clone, Copy, Debug)]
+pub struct SerializationLimits {
+    pub max_depth: usize,
+    pub max_bytes: usize,
+}
+
+impl SerializationLimits {
+    pub const fn new(max_depth: usize, max_bytes: usize) -> Self {
+        Self {
+            max_depth,
+            max_bytes,
+        }
+    }
+}
+
+impl Default for SerializationLimits {
+    fn default() -> Self {
+        Self::new(MAX_JS_DEPTH, MAX_JS_BYTES)
+    }
+}
+
 const TYPE_TAG: &str = "__jsrun_type";
 const UNDEFINED_TYPE: &str = "Undefined";
 const DATE_TYPE: &str = "Date";

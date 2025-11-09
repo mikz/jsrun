@@ -103,6 +103,9 @@ class RuntimeConfig:
         timeout: Optional[float | int] = None,
         enable_console: Optional[bool] = True,
         inspector: Optional[InspectorConfig] = None,
+        snapshot: Optional[bytes] = None,
+        max_serialization_depth: Optional[int] = None,
+        max_serialization_bytes: Optional[int] = None,
     ) -> None:
         """
         Create a new runtime configuration.
@@ -114,6 +117,9 @@ class RuntimeConfig:
             timeout: Execution timeout in seconds (float or int)
             enable_console: Whether ``console`` APIs are exposed (defaults to True)
             inspector: Optional inspector configuration enabling Chrome DevTools
+            snapshot: Optional V8 startup snapshot bytes
+            max_serialization_depth: Maximum nesting depth when transferring values
+            max_serialization_bytes: Maximum serialized byte size when transferring values
         """
         ...
 
@@ -175,6 +181,26 @@ class RuntimeConfig:
     @inspector.setter
     def inspector(self, value: Optional[InspectorConfig]) -> None:
         """Set or clear the inspector configuration."""
+        ...
+
+    @property
+    def max_serialization_depth(self) -> int:
+        """Maximum recursion depth allowed when serializing values."""
+        ...
+
+    @max_serialization_depth.setter
+    def max_serialization_depth(self, value: int) -> None:
+        """Set the maximum recursion depth allowed when serializing values."""
+        ...
+
+    @property
+    def max_serialization_bytes(self) -> int:
+        """Maximum byte size allowed when serializing values."""
+        ...
+
+    @max_serialization_bytes.setter
+    def max_serialization_bytes(self, value: int) -> None:
+        """Set the maximum byte size allowed when serializing values."""
         ...
 
     def __repr__(self) -> str: ...

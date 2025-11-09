@@ -3,7 +3,7 @@
 use crate::runtime::config::RuntimeConfig;
 use crate::runtime::error::{RuntimeError, RuntimeResult};
 use crate::runtime::inspector::{InspectorConnectionState, InspectorMetadata};
-use crate::runtime::js_value::JSValue;
+use crate::runtime::js_value::{JSValue, SerializationLimits};
 use crate::runtime::ops::PythonOpMode;
 use crate::runtime::runner::{
     spawn_runtime_thread, FunctionCallResult, RuntimeCommand, TerminationController,
@@ -29,10 +29,12 @@ pub struct RuntimeHandle {
     tracked_functions: Arc<Mutex<HashSet<u32>>>,
     inspector_metadata: Arc<Mutex<Option<InspectorMetadata>>>,
     inspector_connection: Option<InspectorConnectionState>,
+    serialization_limits: SerializationLimits,
 }
 
 impl RuntimeHandle {
     pub fn spawn(config: RuntimeConfig) -> RuntimeResult<Self> {
+        let serialization_limits = config.serialization_limits();
         let (tx, termination, inspector_info) = spawn_runtime_thread(config)?;
         let (metadata, connection) = inspector_info
             .map(|(meta, state)| (Some(meta), Some(state)))
@@ -44,6 +46,7 @@ impl RuntimeHandle {
             tracked_functions: Arc::new(Mutex::new(HashSet::new())),
             inspector_metadata: Arc::new(Mutex::new(metadata)),
             inspector_connection: connection,
+            serialization_limits,
         })
     }
 
@@ -447,5 +450,9 @@ impl RuntimeHandle {
 
     pub fn inspector_metadata(&self) -> Option<InspectorMetadata> {
         self.inspector_metadata.lock().unwrap().clone()
+    }
+
+    pub fn serialization_limits(&self) -> SerializationLimits {
+        self.serialization_limits
     }
 }
