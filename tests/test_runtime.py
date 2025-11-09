@@ -20,6 +20,7 @@ from jsrun import (
     RuntimeConfig,
     RuntimeStats,
     RuntimeTerminated,
+    SnapshotBuilder,
     undefined,
 )
 
@@ -1467,3 +1468,25 @@ class TestRuntimeOpsNativeTypes:
                 runtime.eval("__host_op_sync__(0)")
             message = str(exc_info.value).lower()
             assert "size" in message or "limit" in message
+
+
+class TestSnapshots:
+    def test_snapshot_builder_roundtrip(self):
+        builder = SnapshotBuilder()
+        builder.execute_script("setup.js", "globalThis.answer = 42;")
+        snapshot_bytes = builder.build()
+
+        config = RuntimeConfig(snapshot=snapshot_bytes)
+        runtime = Runtime(config)
+        try:
+            assert runtime.eval("answer") == 42
+        finally:
+            runtime.close()
+
+    def test_runtime_config_rejects_bootstrap_plus_snapshot(self):
+        builder = SnapshotBuilder()
+        builder.execute_script("setup.js", "globalThis.answer = 42;")
+        snapshot_bytes = builder.build()
+
+        with pytest.raises(ValueError):
+            RuntimeConfig(snapshot=snapshot_bytes, bootstrap="console.log('nope');")

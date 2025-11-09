@@ -14,6 +14,7 @@ pub mod loader;
 pub mod ops;
 pub mod python;
 pub mod runner;
+pub mod snapshot;
 pub mod stats;
 
 #[allow(unused_imports)] // Re-exported for downstream crates.
@@ -138,5 +139,23 @@ mod tests {
         // Verify persistence
         let result3 = handle.eval_sync("counter");
         assert!(matches!(result3.unwrap(), js_value::JSValue::Int(1)));
+    }
+
+    #[test]
+    fn test_runtime_with_snapshot_bytes() {
+        let mut builder =
+            snapshot::SnapshotBuilder::new(snapshot::SnapshotBuilderConfig::default()).unwrap();
+        builder
+            .execute_script("init.js", "globalThis.answer = 42;")
+            .unwrap();
+        let snapshot = builder.build().unwrap();
+
+        let handle = RuntimeHandle::spawn(RuntimeConfig {
+            snapshot: Some(snapshot),
+            ..RuntimeConfig::default()
+        })
+        .unwrap();
+        let result = handle.eval_sync("answer").unwrap();
+        assert!(matches!(result, js_value::JSValue::Int(42)));
     }
 }

@@ -27,6 +27,7 @@ use pyo3_async_runtimes::TaskLocals;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ptr;
+use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::Receiver as StdReceiver;
@@ -88,6 +89,62 @@ struct SyncWatchdog {
     fired: Arc<AtomicBool>,
     cancel_flag: Arc<AtomicBool>,
     duration: Duration,
+}
+
+enum SnapshotSource {
+    Owned(OwnedSnapshot),
+}
+
+impl SnapshotSource {
+    fn from_vec(bytes: Vec<u8>) -> Self {
+        SnapshotSource::Owned(OwnedSnapshot::new(bytes))
+    }
+
+    fn as_static(&mut self) -> &'static [u8] {
+        match self {
+            SnapshotSource::Owned(owned) => owned.as_static(),
+        }
+    }
+}
+
+struct OwnedSnapshot {
+    data: Option<Box<[u8]>>,
+    leaked_ptr: Option<NonNull<[u8]>>,
+}
+
+impl OwnedSnapshot {
+    fn new(bytes: Vec<u8>) -> Self {
+        Self {
+            data: Some(bytes.into_boxed_slice()),
+            leaked_ptr: None,
+        }
+    }
+
+    fn as_static(&mut self) -> &'static [u8] {
+        if let Some(ptr) = self.leaked_ptr {
+            // SAFETY: pointer remains valid until Drop reconstructs the box.
+            return unsafe { ptr.as_ref() };
+        }
+
+        let boxed = self
+            .data
+            .take()
+            .expect("OwnedSnapshot bytes already leaked");
+        let leaked: &'static mut [u8] = Box::leak(boxed);
+        self.leaked_ptr = Some(NonNull::from(&mut *leaked));
+        leaked
+    }
+}
+
+impl Drop for OwnedSnapshot {
+    fn drop(&mut self) {
+        if let Some(ptr) = self.leaked_ptr.take() {
+            // SAFETY: pointer came from Box::leak and has not been reclaimed yet.
+            unsafe {
+                let _ = Box::from_raw(ptr.as_ptr());
+            }
+        }
+    }
 }
 
 impl TerminationController {
@@ -1452,6 +1509,8 @@ struct RuntimeCoreState {
     termination: TerminationController,
     terminated: bool,
     inspector_state: Option<InspectorRuntimeState>,
+    #[allow(dead_code)]
+    startup_snapshot: Option<SnapshotSource>,
 }
 
 impl RuntimeCoreState {
@@ -1467,6 +1526,7 @@ impl RuntimeCoreState {
             bootstrap_script,
             enable_console,
             inspector,
+            snapshot,
         } = config;
 
         if initial_heap_size.is_some() && max_heap_size.is_none() {
@@ -1492,6 +1552,9 @@ impl RuntimeCoreState {
             (None, _) => None,
         };
 
+        let mut snapshot_source = snapshot.map(SnapshotSource::from_vec);
+        let startup_snapshot = snapshot_source.as_mut().map(|source| source.as_static());
+
         let inspector_enabled = inspector.is_some();
         let mut js_runtime = JsRuntime::new(RuntimeOptions {
             extensions: vec![extension],
@@ -1499,6 +1562,7 @@ impl RuntimeCoreState {
             module_loader: Some(module_loader.clone()),
             inspector: inspector_enabled,
             is_main: true,
+            startup_snapshot,
             ..Default::default()
         });
 
@@ -1592,6 +1656,7 @@ impl RuntimeCoreState {
             termination,
             terminated: false,
             inspector_state,
+            startup_snapshot: snapshot_source,
         })
     }
 

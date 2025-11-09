@@ -176,6 +176,9 @@ pub struct RuntimeConfig {
 
     /// Optional inspector configuration.
     pub inspector: Option<InspectorConfig>,
+
+    /// Startup snapshot bytes.
+    pub snapshot: Option<Vec<u8>>,
 }
 
 impl Default for RuntimeConfig {
@@ -187,6 +190,7 @@ impl Default for RuntimeConfig {
             bootstrap_script: None,
             enable_console: Some(true),
             inspector: None,
+            snapshot: None,
         }
     }
 }
@@ -202,6 +206,7 @@ impl RuntimeConfig {
         timeout = None,
         enable_console = Some(true),
         inspector = None,
+        snapshot = None,
     ))]
     fn new(
         max_heap_size: Option<usize>,
@@ -210,7 +215,14 @@ impl RuntimeConfig {
         timeout: Option<&Bound<'_, PyAny>>,
         enable_console: Option<bool>,
         inspector: Option<InspectorConfig>,
+        snapshot: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
+        if bootstrap.is_some() && snapshot.is_some() {
+            return Err(PyValueError::new_err(
+                "snapshot and bootstrap cannot be used together",
+            ));
+        }
+
         let mut config = RuntimeConfig {
             inspector,
             ..RuntimeConfig::default()
@@ -261,6 +273,14 @@ impl RuntimeConfig {
             config.enable_console = Some(enable);
         }
 
+        if let Some(snapshot_obj) = snapshot {
+            let bytes = snapshot_obj.extract::<Vec<u8>>()?;
+            if bytes.is_empty() {
+                return Err(PyValueError::new_err("Snapshot bytes cannot be empty"));
+            }
+            config.snapshot = Some(bytes);
+        }
+
         Ok(config)
     }
 
@@ -296,8 +316,14 @@ impl RuntimeConfig {
 
     /// Set bootstrap script.
     #[setter]
-    fn set_bootstrap(&mut self, source: String) {
+    fn set_bootstrap(&mut self, source: String) -> PyResult<()> {
+        if self.snapshot.is_some() {
+            return Err(PyValueError::new_err(
+                "snapshot and bootstrap cannot be used together",
+            ));
+        }
         self.bootstrap_script = Some(source);
+        Ok(())
     }
 
     /// Get execution timeout in seconds.
@@ -352,6 +378,35 @@ impl RuntimeConfig {
         self.inspector = inspector;
     }
 
+    /// Get snapshot bytes (copied).
+    ///
+    /// Warning: this clones the entire snapshot. For large snapshots, avoid
+    /// calling this repeatedly.
+    #[getter]
+    fn snapshot(&self) -> Option<Vec<u8>> {
+        self.snapshot.clone()
+    }
+
+    /// Set snapshot bytes.
+    #[setter]
+    fn set_snapshot(&mut self, data: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
+        if data.is_none() {
+            self.snapshot = None;
+            return Ok(());
+        }
+        if self.bootstrap_script.is_some() {
+            return Err(PyValueError::new_err(
+                "snapshot and bootstrap cannot be used together",
+            ));
+        }
+        let bytes = data.unwrap().extract::<Vec<u8>>()?;
+        if bytes.is_empty() {
+            return Err(PyValueError::new_err("Snapshot bytes cannot be empty"));
+        }
+        self.snapshot = Some(bytes);
+        Ok(())
+    }
+
     fn __repr__(&self) -> String {
         format!("RuntimeConfig({:?})", self)
     }
@@ -370,6 +425,7 @@ mod tests {
         assert!(config.bootstrap_script.is_none());
         assert_eq!(config.enable_console, Some(true));
         assert!(config.inspector.is_none());
+        assert!(config.snapshot.is_none());
     }
 
     #[allow(clippy::field_reassign_with_default)]

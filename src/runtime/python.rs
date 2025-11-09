@@ -8,11 +8,12 @@ use super::inspector::InspectorMetadata;
 use super::js_value::JSValue;
 use super::ops::PythonOpMode;
 use super::runner::FunctionCallResult;
+use super::snapshot::{SnapshotBuilder, SnapshotBuilderConfig};
 use super::stats::{RuntimeCallKind, RuntimeStatsSnapshot};
 use pyo3::create_exception;
 use pyo3::exceptions::{PyException, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::{PyBytes, PyDict, PyList};
 use pyo3_async_runtimes::{tokio as pyo3_tokio, TaskLocals};
 use std::future::Future;
 use std::sync::OnceLock;
@@ -28,6 +29,11 @@ static JS_UNDEFINED_SINGLETON: OnceLock<Py<JsUndefined>> = OnceLock::new();
 
 create_exception!(crate::runtime::python, JavaScriptError, PyException);
 create_exception!(crate::runtime::python, RuntimeTerminated, PyRuntimeError);
+
+#[pyclass(name = "SnapshotBuilder", module = "jsrun", unsendable)]
+pub struct SnapshotBuilderPy {
+    builder: std::cell::RefCell<Option<SnapshotBuilder>>,
+}
 
 fn set_optional_attr(py: Python<'_>, value: &Bound<'_, PyAny>, name: &str, attr: Option<String>) {
     match attr {
@@ -189,6 +195,46 @@ fn python_future_cancelled(future: &Bound<'_, PyAny>) -> PyResult<bool> {
         .getattr(pyo3::intern!(future.py(), "cancelled"))?
         .call0()?
         .is_truthy()
+}
+
+#[pymethods]
+impl SnapshotBuilderPy {
+    #[new]
+    #[pyo3(signature = (
+        bootstrap = None,
+        enable_console = Some(true),
+    ))]
+    fn new(bootstrap: Option<String>, enable_console: Option<bool>) -> PyResult<Self> {
+        let config = SnapshotBuilderConfig {
+            bootstrap_script: bootstrap,
+            enable_console,
+        };
+        let builder = SnapshotBuilder::new(config).map_err(runtime_error_to_py)?;
+        Ok(Self {
+            builder: std::cell::RefCell::new(Some(builder)),
+        })
+    }
+
+    fn execute_script(&self, name: &str, source: &str) -> PyResult<()> {
+        let mut guard = self.builder.borrow_mut();
+        let builder = guard
+            .as_mut()
+            .ok_or_else(|| PyRuntimeError::new_err("Snapshot already built"))?;
+        builder
+            .execute_script(name, source)
+            .map_err(runtime_error_to_py)?;
+        Ok(())
+    }
+
+    fn build(&self, py: Python<'_>) -> PyResult<Py<PyBytes>> {
+        let builder = self
+            .builder
+            .borrow_mut()
+            .take()
+            .ok_or_else(|| PyRuntimeError::new_err("Snapshot already built"))?;
+        let bytes = builder.build().map_err(runtime_error_to_py)?;
+        Ok(PyBytes::new(py, &bytes).into())
+    }
 }
 
 #[pyclass]

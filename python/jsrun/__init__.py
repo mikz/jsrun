@@ -19,6 +19,7 @@ from ._jsrun import (
     RuntimeConfig,
     RuntimeStats,
     RuntimeTerminated,
+    SnapshotBuilder,
     undefined,
 )
 
@@ -243,6 +244,7 @@ __all__ = [
     "RuntimeConfig",
     "InspectorConfig",
     "InspectorEndpoints",
+    "SnapshotBuilder",
     "JsFunction",
     "JsUndefined",
     "RuntimeStats",
