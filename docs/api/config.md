@@ -1,0 +1,3 @@
+# `RuntimeConfig`
+
+::: jsrun.RuntimeConfig

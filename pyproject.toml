@@ -15,7 +15,16 @@ dynamic = ["version"]
 [dependency-groups]
 dev = ["maturin"]
 testing = [{ include-group = "dev" }, "pytest>=8.4.0", "pytest-asyncio>=1.2.0"]
-all = [{ include-group = "dev" }, { include-group = 'testing' }]
+docs = [
+  "mkdocs>=1.6.0",
+  "mkdocs-material>=9.6.0",
+  "mkdocstrings[python]>=0.28.0",
+]
+all = [
+  { include-group = "dev" },
+  { include-group = 'testing' },
+  { include-group = 'docs' },
+]
 
 [tool.maturin]
 features = ["pyo3/extension-module"]

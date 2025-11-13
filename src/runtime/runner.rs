@@ -112,6 +112,47 @@ struct SyncWatchdog {
     duration: Duration,
 }
 
+impl SyncWatchdog {
+    fn spawn(duration: Duration, termination: TerminationController) -> RuntimeResult<Self> {
+        let fired = Arc::new(AtomicBool::new(false));
+        let fired_for_thread = fired.clone();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let cancel_for_thread = cancel_flag.clone();
+
+        let handle = thread::Builder::new()
+            .name("jsrun-sync-watchdog".to_string())
+            .spawn(move || {
+                let deadline = Instant::now() + duration;
+                loop {
+                    if cancel_for_thread.load(Ordering::Acquire) {
+                        return;
+                    }
+
+                    let now = Instant::now();
+                    if now >= deadline {
+                        fired_for_thread.store(true, Ordering::Release);
+                        termination.terminate_execution();
+                        return;
+                    }
+
+                    let remaining = deadline.saturating_duration_since(now);
+                    let sleep_dur = remaining.min(Duration::from_millis(10));
+                    thread::sleep(sleep_dur);
+                }
+            })
+            .map_err(|e| {
+                RuntimeError::internal(format!("Failed to spawn watchdog thread: {}", e))
+            })?;
+
+        Ok(Self {
+            handle,
+            fired,
+            cancel_flag,
+            duration,
+        })
+    }
+}
+
 enum SnapshotSource {
     Owned(OwnedSnapshot),
 }
@@ -352,7 +393,7 @@ impl RuntimeDispatcher {
                             tracing::error!("Unexpected event loop error: {runtime_err_debug}");
                             let elapsed = completed_job.start_time().elapsed();
                             self.core.stats_state.record(completed_job.kind(), elapsed);
-                            completed_job.send_result(Err(runtime_err));
+                            completed_job.finish(&mut self.core, Err(runtime_err));
                             self.core.clear_task_locals();
                             if let Some(next_job) = self.pending_jobs.pop_front() {
                                 self.active_job = Some(next_job);
@@ -378,7 +419,7 @@ impl RuntimeDispatcher {
                         let completed_job = self.active_job.take().unwrap();
                         let elapsed = completed_job.start_time().elapsed();
                         self.core.stats_state.record(completed_job.kind(), elapsed);
-                        completed_job.send_result(result);
+                        completed_job.finish(&mut self.core, result);
 
                         // Clear task locals to prevent stale event loop references
                         self.core.clear_task_locals();
@@ -454,9 +495,24 @@ impl RuntimeDispatcher {
                     return false;
                 }
 
+                // Determine effective timeout and spawn watchdog if needed
+                let effective_timeout = self.core.effective_timeout_ms(timeout_ms);
+                let watchdog = match self.core.start_timeout_watchdog(effective_timeout) {
+                    Ok(watchdog) => watchdog,
+                    Err(err) => {
+                        let _ = responder.send(Err(err));
+                        return false;
+                    }
+                };
+
                 // Create the job
-                let job =
-                    EvalAsyncJob::new(code.clone(), timeout_ms, task_locals, responder, &self.core);
+                let job = EvalAsyncJob::new(
+                    code.clone(),
+                    effective_timeout,
+                    task_locals,
+                    responder,
+                    watchdog,
+                );
 
                 // Queue or activate the job
                 if self.active_job.is_none() {
@@ -573,13 +629,23 @@ impl RuntimeDispatcher {
                     return false;
                 }
 
+                // Determine effective timeout and spawn watchdog if needed
+                let effective_timeout = self.core.effective_timeout_ms(timeout_ms);
+                let watchdog = match self.core.start_timeout_watchdog(effective_timeout) {
+                    Ok(watchdog) => watchdog,
+                    Err(err) => {
+                        let _ = responder.send(Err(err));
+                        return false;
+                    }
+                };
+
                 // Create the job
                 let job = EvalModuleAsyncJob::new(
                     specifier,
-                    timeout_ms,
+                    effective_timeout,
                     task_locals,
                     responder,
-                    &self.core,
+                    watchdog,
                 );
 
                 // Queue or activate the job
@@ -728,7 +794,7 @@ impl RuntimeDispatcher {
                 // Cancel active job if exists
                 if let Some(job) = self.active_job.take() {
                     tracing::debug!("Terminating active job on interrupt");
-                    job.send_result(Err(RuntimeError::terminated()));
+                    job.finish(&mut self.core, Err(RuntimeError::terminated()));
                 }
 
                 // Cancel all pending jobs
@@ -737,7 +803,7 @@ impl RuntimeDispatcher {
                     tracing::debug!(count = pending_count, "Cancelling pending jobs");
                 }
                 while let Some(job) = self.pending_jobs.pop_front() {
-                    job.send_result(Err(RuntimeError::terminated()));
+                    job.finish(&mut self.core, Err(RuntimeError::terminated()));
                 }
 
                 // Clear task locals to prevent stale event loop references
@@ -773,7 +839,7 @@ impl RuntimeDispatcher {
         tracing::warn!("Command channel closed without explicit shutdown - cleaning up");
         if let Some(job) = self.active_job.take() {
             tracing::debug!("Dropping active job after command channel closed");
-            job.send_result(Err(RuntimeError::terminated()));
+            job.finish(&mut self.core, Err(RuntimeError::terminated()));
         }
 
         if !self.pending_jobs.is_empty() {
@@ -783,7 +849,7 @@ impl RuntimeDispatcher {
             );
         }
         while let Some(job) = self.pending_jobs.pop_front() {
-            job.send_result(Err(RuntimeError::terminated()));
+            job.finish(&mut self.core, Err(RuntimeError::terminated()));
         }
 
         self.core.clear_task_locals();
@@ -807,8 +873,8 @@ trait RuntimeJob {
     /// The job can borrow core mutably but must release it before returning.
     fn poll(&mut self, core: &mut RuntimeCoreState) -> std::task::Poll<RuntimeResult<JSValue>>;
 
-    /// Send the result back to the caller
-    fn send_result(self: Box<Self>, result: RuntimeResult<JSValue>);
+    /// Finalize the job with a result, allowing cleanup before responding.
+    fn finish(self: Box<Self>, core: &mut RuntimeCoreState, result: RuntimeResult<JSValue>);
 
     /// Get the start time for stats tracking
     fn start_time(&self) -> Instant;
@@ -823,6 +889,7 @@ struct EvalAsyncJob {
     start_time: Instant,
     deadline: Option<Instant>,
     state: EvalAsyncJobState,
+    watchdog: Option<SyncWatchdog>,
 }
 
 enum EvalAsyncJobState {
@@ -843,23 +910,21 @@ impl EvalAsyncJob {
         timeout_ms: Option<u64>,
         task_locals: Option<TaskLocals>,
         responder: oneshot::Sender<RuntimeResult<JSValue>>,
-        core: &RuntimeCoreState,
+        watchdog: Option<SyncWatchdog>,
     ) -> Self {
         let start_time = Instant::now();
 
-        // Determine effective timeout
-        let effective_timeout = core.effective_timeout_ms(timeout_ms);
-
-        let deadline = effective_timeout.map(|ms| start_time + Duration::from_millis(ms));
+        let deadline = timeout_ms.map(|ms| start_time + Duration::from_millis(ms));
 
         Self {
             code,
-            timeout_ms: effective_timeout,
+            timeout_ms,
             task_locals,
             responder,
             start_time,
             deadline,
             state: EvalAsyncJobState::Init,
+            watchdog,
         }
     }
 }
@@ -990,7 +1055,8 @@ impl RuntimeJob for EvalAsyncJob {
         }
     }
 
-    fn send_result(self: Box<Self>, result: RuntimeResult<JSValue>) {
+    fn finish(mut self: Box<Self>, core: &mut RuntimeCoreState, result: RuntimeResult<JSValue>) {
+        let result = core.apply_watchdog_result(result, self.watchdog.take(), "Async evaluation");
         let _ = self.responder.send(result);
     }
 
@@ -1104,7 +1170,7 @@ impl RuntimeJob for StreamReadJob {
         }
     }
 
-    fn send_result(self: Box<Self>, result: RuntimeResult<JSValue>) {
+    fn finish(self: Box<Self>, _core: &mut RuntimeCoreState, result: RuntimeResult<JSValue>) {
         let _ = self.responder.send(result);
     }
 
@@ -1122,6 +1188,7 @@ struct EvalModuleAsyncJob {
     start_time: Instant,
     deadline: Option<Instant>,
     state: EvalModuleAsyncJobState,
+    watchdog: Option<SyncWatchdog>,
 }
 
 enum EvalModuleAsyncJobState {
@@ -1144,31 +1211,21 @@ impl EvalModuleAsyncJob {
         timeout_ms: Option<u64>,
         task_locals: Option<TaskLocals>,
         responder: oneshot::Sender<RuntimeResult<JSValue>>,
-        core: &RuntimeCoreState,
+        watchdog: Option<SyncWatchdog>,
     ) -> Self {
         let start_time = Instant::now();
 
-        let effective_timeout = timeout_ms.or_else(|| {
-            core.execution_timeout.map(|d| {
-                let millis = d.as_millis();
-                if millis > u128::from(u64::MAX) {
-                    u64::MAX
-                } else {
-                    millis as u64
-                }
-            })
-        });
-
-        let deadline = effective_timeout.map(|ms| start_time + Duration::from_millis(ms));
+        let deadline = timeout_ms.map(|ms| start_time + Duration::from_millis(ms));
 
         Self {
             specifier,
-            timeout_ms: effective_timeout,
+            timeout_ms,
             task_locals,
             responder,
             start_time,
             deadline,
             state: EvalModuleAsyncJobState::Init,
+            watchdog,
         }
     }
 }
@@ -1308,7 +1365,9 @@ impl RuntimeJob for EvalModuleAsyncJob {
         }
     }
 
-    fn send_result(self: Box<Self>, result: RuntimeResult<JSValue>) {
+    fn finish(mut self: Box<Self>, core: &mut RuntimeCoreState, result: RuntimeResult<JSValue>) {
+        let result =
+            core.apply_watchdog_result(result, self.watchdog.take(), "Async module evaluation");
         let _ = self.responder.send(result);
     }
 
@@ -1547,7 +1606,7 @@ impl RuntimeJob for CallFunctionAsyncJob {
         }
     }
 
-    fn send_result(self: Box<Self>, result: RuntimeResult<JSValue>) {
+    fn finish(self: Box<Self>, _core: &mut RuntimeCoreState, result: RuntimeResult<JSValue>) {
         let _ = self.responder.send(result);
     }
 
@@ -1673,7 +1732,7 @@ impl RuntimeJob for ResumeFunctionCallJob {
         }
     }
 
-    fn send_result(self: Box<Self>, result: RuntimeResult<JSValue>) {
+    fn finish(self: Box<Self>, _core: &mut RuntimeCoreState, result: RuntimeResult<JSValue>) {
         let _ = self.responder.send(result);
     }
 
@@ -2065,46 +2124,21 @@ impl RuntimeCoreState {
     }
 
     fn start_sync_watchdog(&self) -> RuntimeResult<Option<SyncWatchdog>> {
-        match self.execution_timeout {
-            None => Ok(None),
-            Some(duration) => {
-                let fired = Arc::new(AtomicBool::new(false));
-                let fired_for_thread = fired.clone();
-                let cancel_flag = Arc::new(AtomicBool::new(false));
-                let cancel_for_thread = cancel_flag.clone();
-                let termination = self.termination.clone();
-                let handle = thread::Builder::new()
-                    .name("jsrun-sync-watchdog".to_string())
-                    .spawn(move || {
-                        let deadline = Instant::now() + duration;
-                        loop {
-                            if cancel_for_thread.load(Ordering::Acquire) {
-                                return;
-                            }
+        self.execution_timeout
+            .map(|duration| SyncWatchdog::spawn(duration, self.termination.clone()))
+            .transpose()
+    }
 
-                            let now = Instant::now();
-                            if now >= deadline {
-                                fired_for_thread.store(true, Ordering::Release);
-                                termination.terminate_execution();
-                                return;
-                            }
-
-                            let remaining = deadline.saturating_duration_since(now);
-                            let sleep_dur = remaining.min(Duration::from_millis(10));
-                            thread::sleep(sleep_dur);
-                        }
-                    })
-                    .map_err(|e| {
-                        RuntimeError::internal(format!("Failed to spawn watchdog thread: {}", e))
-                    })?;
-                Ok(Some(SyncWatchdog {
-                    handle,
-                    fired,
-                    cancel_flag,
-                    duration,
-                }))
-            }
-        }
+    fn start_timeout_watchdog(
+        &self,
+        timeout_ms: Option<u64>,
+    ) -> RuntimeResult<Option<SyncWatchdog>> {
+        timeout_ms
+            .map(|ms| {
+                let duration = Duration::from_millis(ms);
+                SyncWatchdog::spawn(duration, self.termination.clone())
+            })
+            .transpose()
     }
 
     fn resolve_sync_watchdog(&mut self, watchdog: SyncWatchdog) -> RuntimeResult<(bool, Duration)> {

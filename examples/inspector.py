@@ -6,8 +6,6 @@ Execution will pause until the debugger attaches; hit the play button (or run
 `Runtime.runIfWaitingForDebugger` in the DevTools console) to continue.
 """
 
-from __future__ import annotations
-
 from jsrun import InspectorConfig, Runtime, RuntimeConfig
 
 

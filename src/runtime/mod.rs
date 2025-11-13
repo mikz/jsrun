@@ -1,4 +1,4 @@
-//! Tokio-based JavaScript runtime for multi-tenant execution.
+//! Tokio-based JavaScript runtime.
 //!
 //! This module implements a Rust-first, async runtime patterned after `deno_core`.
 //! Each runtime owns a single V8 isolate running on a dedicated OS thread with a

@@ -66,6 +66,14 @@ test:
 test-quiet:
 	uv run python -m pytest tests/ -q
 
+.PHONY: docs  ## Build the documentation
+docs:
+	uv run mkdocs build
+
+.PHONY: docs-serve  ## Build and serve the documentation
+docs-serve:
+	uv run mkdocs serve --livereload
+
 .PHONY: all  ## Run the standard set of checks performed in CI
 all: format build-dev lint test
 
@@ -79,6 +87,7 @@ clean:
 	rm -rf .pytest_cache
 	rm -rf *.egg-info
 	rm -rf build
+	rm -rf site
 	rm -f python/jsrun/*.so
 
 .PHONY: help  ## Display this message

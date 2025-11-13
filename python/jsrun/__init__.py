@@ -1,13 +1,12 @@
 """High-level Python bindings for the jsrun runtime."""
 
-from __future__ import annotations
-
 import contextvars
 import asyncio
 import atexit
 import threading
 from dataclasses import dataclass
-from typing import Any, Callable, Optional, TypeVar, cast, overload
+from collections.abc import Callable
+from typing import Any, TypeVar, cast, overload
 
 from ._jsrun import (
     InspectorConfig,
@@ -28,17 +27,17 @@ F = TypeVar("F", bound=Callable[..., Any])
 
 
 @overload
-def _runtime_bind(self: Runtime, func: F, /, *, name: Optional[str] = ...) -> F: ...
+def _runtime_bind(self: Runtime, func: F, /, *, name: str | None = ...) -> F: ...
 
 
 @overload
 def _runtime_bind(
-    self: Runtime, func: None = ..., /, *, name: Optional[str] = ...
+    self: Runtime, func: None = ..., /, *, name: str | None = ...
 ) -> Callable[[F], F]: ...
 
 
 def _runtime_bind(
-    self: Runtime, func: object | None = None, /, *, name: Optional[str] = None
+    self: Runtime, func: object | None = None, /, *, name: str | None = None
 ) -> Callable[[F], F] | F:
     """Bind a Python callable to the runtime via a decorator-friendly API.
 

@@ -20,14 +20,13 @@ fn _jsrun(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<runtime::python::SnapshotBuilderPy>()?;
     m.add_class::<runtime::RuntimeConfig>()?;
     m.add_class::<runtime::config::InspectorConfig>()?;
-    m.add(
-        "JavaScriptError",
-        m.py().get_type::<runtime::python::JavaScriptError>(),
-    )?;
-    m.add(
-        "RuntimeTerminated",
-        m.py().get_type::<runtime::python::RuntimeTerminated>(),
-    )?;
+    let js_error_type = m.py().get_type::<runtime::python::JavaScriptError>();
+    js_error_type.setattr("__module__", "jsrun")?;
+    m.add("JavaScriptError", js_error_type)?;
+
+    let runtime_terminated_type = m.py().get_type::<runtime::python::RuntimeTerminated>();
+    runtime_terminated_type.setattr("__module__", "jsrun")?;
+    m.add("RuntimeTerminated", runtime_terminated_type)?;
     let undefined: Py<PyAny> = runtime::python::get_js_undefined(m.py())?.into();
     m.add("undefined", undefined)?;
     m.add_function(pyo3::wrap_pyfunction!(

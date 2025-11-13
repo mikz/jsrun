@@ -1355,6 +1355,33 @@ class TestRuntimeConfig:
             message = str(exc_info.value).lower()
             assert "timed out" in message or "pending" in message
 
+    @pytest.mark.asyncio
+    async def test_eval_async_timeout_interrupts_sync_loop(self):
+        """Explicit eval_async timeout should terminate blocking JavaScript loops."""
+        from jsrun import Runtime
+
+        with Runtime() as runtime:
+            start = time.monotonic()
+            with pytest.raises(RuntimeError) as exc_info:
+                await runtime.eval_async("while (true) {}", timeout=0.1)
+            elapsed = time.monotonic() - start
+            assert elapsed < 1.0
+            assert "timed out" in str(exc_info.value).lower()
+
+    @pytest.mark.asyncio
+    async def test_eval_module_async_timeout_interrupts_sync_loop(self):
+        """Explicit eval_module_async timeout should terminate blocking module execution."""
+        from jsrun import Runtime
+
+        with Runtime() as runtime:
+            runtime.add_static_module("loop", "while (true) {}")
+            start = time.monotonic()
+            with pytest.raises(RuntimeError) as exc_info:
+                await runtime.eval_module_async("static:loop", timeout=0.1)
+            elapsed = time.monotonic() - start
+            assert elapsed < 1.0
+            assert "timed out" in str(exc_info.value).lower()
+
     def test_runtime_with_config(self):
         """Test Runtime creation with RuntimeConfig."""
         from jsrun import Runtime, RuntimeConfig

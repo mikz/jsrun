@@ -1,8 +1,6 @@
 """Minimal FastAPI app exposing multi-tenant JavaScript execution."""
 
-from __future__ import annotations
-
-from typing import AsyncIterator, Dict
+from collections.abc import AsyncIterator
 
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
@@ -15,7 +13,7 @@ class EvalRequest(BaseModel):
     code: str
 
 
-_tenants: Dict[str, Runtime] = {}
+_tenants: dict[str, Runtime] = {}
 
 
 def get_runtime(tenant_id: str) -> Runtime:
