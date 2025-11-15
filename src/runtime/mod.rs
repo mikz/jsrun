@@ -112,6 +112,23 @@ mod tests {
 
     #[allow(clippy::field_reassign_with_default)]
     #[test]
+    fn test_runtime_terminates_when_heap_limit_exceeded() {
+        let mut config = RuntimeConfig::default();
+        config.max_heap_size = Some(5 * 1024 * 1024); // 5 MB
+        config.initial_heap_size = Some(1024 * 1024); // 1 MB
+
+        let mut handle = RuntimeHandle::spawn(config).unwrap();
+        let result = handle.eval_sync("let s = 'jsrun'; while (true) { s = s + s; }");
+
+        assert!(matches!(
+            result,
+            Err(RuntimeError::Terminated { reason: _ })
+        ));
+        handle.close().unwrap();
+    }
+
+    #[allow(clippy::field_reassign_with_default)]
+    #[test]
     fn test_runtime_with_bootstrap() {
         let mut config = RuntimeConfig::default();
         config.bootstrap_script = Some("globalThis.VERSION = '1.0.0';".to_string());

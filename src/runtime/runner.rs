@@ -35,7 +35,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc::Receiver as StdReceiver;
 use std::sync::mpsc::Sender as StdSender;
 use std::sync::mpsc::Sender;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -71,38 +71,68 @@ impl Drop for RuntimeThreadGuard {
     }
 }
 
-/// Stored function with optional receiver for 'this' binding
+/// Stored function with optional receiver for 'this' binding.
+///
+/// Holds a V8 global handle to a JavaScript function and an optional receiver
+/// object for method calls.
 struct StoredFunction {
+    /// Global handle to the JavaScript function.
     function: v8::Global<v8::Function>,
+    /// Optional receiver object for method invocation ('this' binding).
     receiver: Option<v8::Global<v8::Value>>,
 }
 
 /// Pending JavaScript promise produced by a synchronous call.
+///
+/// Tracks a promise returned from a function call that hasn't resolved yet,
+/// along with timeout information.
 struct PendingFunctionCall {
+    /// Global handle to the pending promise.
     promise: v8::Global<v8::Promise>,
+    /// Time when the call started (for tracking elapsed time).
     start_time: Instant,
+    /// Absolute deadline for timeout (if specified).
     deadline: Option<Instant>,
+    /// Timeout duration in milliseconds (if specified).
     timeout_ms: Option<u64>,
 }
 
 /// Outcome of attempting to call a JS function synchronously.
+///
+/// A function call can either complete immediately (non-promise return value)
+/// or require asynchronous polling (promise return value).
 pub enum FunctionCallResult {
+    /// Function returned a non-promise value immediately.
     Immediate(JSValue),
+    /// Function returned a promise; call ID can be used to resume.
     Pending { call_id: u64 },
 }
 
 const TERMINATION_STATUS_RUNNING: u8 = 0;
 const TERMINATION_STATUS_REQUESTED: u8 = 1;
 const TERMINATION_STATUS_TERMINATED: u8 = 2;
+/// Minimum amount of memory we temporarily add to the heap limit when V8 tells us
+/// it's out of space so that it can unwind and propagate an exception instead of
+/// killing the process.
+const NEAR_HEAP_LIMIT_MIN_HEADROOM_BYTES: usize = 1024 * 1024; // 1 MiB
 
+/// Thread-safe controller for V8 isolate termination.
+///
+/// Provides a clone-able handle to request and track termination of a V8 isolate.
+/// Uses atomic operations to coordinate termination state across threads.
 #[derive(Clone)]
 pub struct TerminationController {
     inner: Arc<TerminationState>,
 }
 
+/// Internal state for termination tracking.
 struct TerminationState {
+    /// Atomic status: 0=running, 1=requested, 2=terminated.
     status: AtomicU8,
+    /// V8 isolate handle for triggering execution termination.
     isolate_handle: v8::IsolateHandle,
+    /// Optional reason describing why termination was requested.
+    reason: Mutex<Option<String>>,
 }
 
 struct SyncWatchdog {
@@ -113,11 +143,16 @@ struct SyncWatchdog {
 }
 
 impl SyncWatchdog {
-    fn spawn(duration: Duration, termination: TerminationController) -> RuntimeResult<Self> {
+    fn spawn(
+        duration: Duration,
+        termination: TerminationController,
+        reason: impl Into<String>,
+    ) -> RuntimeResult<Self> {
         let fired = Arc::new(AtomicBool::new(false));
         let fired_for_thread = fired.clone();
         let cancel_flag = Arc::new(AtomicBool::new(false));
         let cancel_for_thread = cancel_flag.clone();
+        let reason = reason.into();
 
         let handle = thread::Builder::new()
             .name("jsrun-sync-watchdog".to_string())
@@ -131,6 +166,7 @@ impl SyncWatchdog {
                     let now = Instant::now();
                     if now >= deadline {
                         fired_for_thread.store(true, Ordering::Release);
+                        termination.ensure_reason(reason.clone());
                         termination.terminate_execution();
                         return;
                     }
@@ -215,6 +251,7 @@ impl TerminationController {
             inner: Arc::new(TerminationState {
                 status: AtomicU8::new(TERMINATION_STATUS_RUNNING),
                 isolate_handle,
+                reason: Mutex::new(None),
             }),
         }
     }
@@ -233,6 +270,24 @@ impl TerminationController {
 
     pub fn terminate_execution(&self) {
         self.inner.isolate_handle.terminate_execution();
+    }
+
+    pub fn ensure_reason(&self, reason: impl Into<String>) {
+        let mut guard = self.inner.reason.lock().unwrap();
+        if guard.is_none() {
+            *guard = Some(reason.into());
+        }
+    }
+
+    pub fn reason(&self) -> Option<String> {
+        self.inner.reason.lock().unwrap().clone()
+    }
+
+    pub fn terminated_error(&self) -> RuntimeError {
+        match self.reason() {
+            Some(reason) => RuntimeError::terminated_with(reason),
+            None => RuntimeError::terminated(),
+        }
     }
 
     pub fn is_requested(&self) -> bool {
@@ -254,7 +309,10 @@ impl TerminationController {
     }
 }
 
-/// Commands sent to the runtime thread.
+/// Commands sent from the handle to the runtime thread.
+///
+/// Each command includes a responder channel for returning results or errors.
+/// Commands are processed sequentially on the runtime thread.
 pub enum RuntimeCommand {
     Eval {
         code: String,
@@ -346,10 +404,17 @@ pub enum RuntimeCommand {
 }
 
 /// Dispatcher that multiplexes command processing with async job execution.
+///
+/// Runs the main loop on the runtime thread, polling the V8 event loop, processing
+/// incoming commands, and driving active async jobs to completion.
 struct RuntimeDispatcher {
+    /// Core runtime state (V8 isolate, module loader, op registry, etc).
     core: RuntimeCoreState,
+    /// Channel for receiving commands from the handle.
     cmd_rx: mpsc::UnboundedReceiver<RuntimeCommand>,
+    /// Queue of jobs waiting to execute.
     pending_jobs: std::collections::VecDeque<Box<dyn RuntimeJob>>,
+    /// Currently executing job (if any).
     active_job: Option<Box<dyn RuntimeJob>>,
 }
 
@@ -437,7 +502,7 @@ impl RuntimeDispatcher {
 
             // 3. ASYNCHRONOUSLY wait for new commands or yield to allow other tasks to run
             let should_exit = tokio::select! {
-                biased; // Prefer new commands over yielding
+                biased; // Prefer new commands to yielding
 
                 // New command from Python
                 cmd = self.cmd_rx.recv() => {
@@ -464,11 +529,14 @@ impl RuntimeDispatcher {
         match cmd {
             RuntimeCommand::Eval { code, responder } => {
                 let result = if self.core.should_reject_new_work() {
-                    Err(RuntimeError::terminated())
+                    Err(self.core.terminated_error())
                 } else if let Err(err) = self.core.ensure_inspector_ready() {
                     Err(err)
                 } else {
-                    match self.core.start_sync_watchdog() {
+                    match self
+                        .core
+                        .start_sync_watchdog("Synchronous evaluation timed out")
+                    {
                         Ok(watchdog) => {
                             let result = self.core.eval_sync(&code);
                             self.core
@@ -487,7 +555,7 @@ impl RuntimeDispatcher {
                 responder,
             } => {
                 if self.core.should_reject_new_work() {
-                    let _ = responder.send(Err(RuntimeError::terminated()));
+                    let _ = responder.send(Err(self.core.terminated_error()));
                     return false;
                 }
                 if let Err(err) = self.core.ensure_inspector_ready() {
@@ -497,7 +565,10 @@ impl RuntimeDispatcher {
 
                 // Determine effective timeout and spawn watchdog if needed
                 let effective_timeout = self.core.effective_timeout_ms(timeout_ms);
-                let watchdog = match self.core.start_timeout_watchdog(effective_timeout) {
+                let watchdog = match self
+                    .core
+                    .start_timeout_watchdog(effective_timeout, "Asynchronous evaluation timed out")
+                {
                     Ok(watchdog) => watchdog,
                     Err(err) => {
                         let _ = responder.send(Err(err));
@@ -530,7 +601,7 @@ impl RuntimeDispatcher {
                 responder,
             } => {
                 let result = if self.core.should_reject_new_work() {
-                    Err(RuntimeError::terminated())
+                    Err(self.core.terminated_error())
                 } else {
                     self.core.register_python_op(name, mode, handler)
                 };
@@ -539,7 +610,7 @@ impl RuntimeDispatcher {
             }
             RuntimeCommand::SetModuleResolver { handler, responder } => {
                 let result = if self.core.should_reject_new_work() {
-                    Err(RuntimeError::terminated())
+                    Err(self.core.terminated_error())
                 } else {
                     self.core.module_loader.set_resolver(handler);
                     if let Some(ref locals) = self.core.task_locals {
@@ -552,7 +623,7 @@ impl RuntimeDispatcher {
             }
             RuntimeCommand::SetModuleLoader { handler, responder } => {
                 let result = if self.core.should_reject_new_work() {
-                    Err(RuntimeError::terminated())
+                    Err(self.core.terminated_error())
                 } else {
                     self.core.module_loader.set_loader(handler);
                     if let Some(ref locals) = self.core.task_locals {
@@ -569,7 +640,7 @@ impl RuntimeDispatcher {
                 responder,
             } => {
                 let result = if self.core.should_reject_new_work() {
-                    Err(RuntimeError::terminated())
+                    Err(self.core.terminated_error())
                 } else {
                     self.core.module_loader.add_static_module(name, source);
                     Ok(())
@@ -583,7 +654,7 @@ impl RuntimeDispatcher {
                 responder,
             } => {
                 let result = if self.core.should_reject_new_work() {
-                    Err(RuntimeError::terminated())
+                    Err(self.core.terminated_error())
                 } else {
                     self.core.bind_object(name, properties)
                 };
@@ -595,11 +666,14 @@ impl RuntimeDispatcher {
                 responder,
             } => {
                 let result = if self.core.should_reject_new_work() {
-                    Err(RuntimeError::terminated())
+                    Err(self.core.terminated_error())
                 } else if let Err(err) = self.core.ensure_inspector_ready() {
                     Err(err)
                 } else {
-                    match self.core.start_sync_watchdog() {
+                    match self
+                        .core
+                        .start_sync_watchdog("Synchronous module evaluation timed out")
+                    {
                         Ok(watchdog) => {
                             let result = self.core.eval_module_sync(&specifier);
                             self.core.apply_watchdog_result(
@@ -621,7 +695,7 @@ impl RuntimeDispatcher {
                 responder,
             } => {
                 if self.core.should_reject_new_work() {
-                    let _ = responder.send(Err(RuntimeError::terminated()));
+                    let _ = responder.send(Err(self.core.terminated_error()));
                     return false;
                 }
                 if let Err(err) = self.core.ensure_inspector_ready() {
@@ -631,7 +705,10 @@ impl RuntimeDispatcher {
 
                 // Determine effective timeout and spawn watchdog if needed
                 let effective_timeout = self.core.effective_timeout_ms(timeout_ms);
-                let watchdog = match self.core.start_timeout_watchdog(effective_timeout) {
+                let watchdog = match self.core.start_timeout_watchdog(
+                    effective_timeout,
+                    "Asynchronous module evaluation timed out",
+                ) {
                     Ok(watchdog) => watchdog,
                     Err(err) => {
                         let _ = responder.send(Err(err));
@@ -663,11 +740,14 @@ impl RuntimeDispatcher {
                 responder,
             } => {
                 let result = if self.core.should_reject_new_work() {
-                    Err(RuntimeError::terminated())
+                    Err(self.core.terminated_error())
                 } else if let Err(err) = self.core.ensure_inspector_ready() {
                     Err(err)
                 } else {
-                    match self.core.start_sync_watchdog() {
+                    match self
+                        .core
+                        .start_sync_watchdog("Synchronous function call timed out")
+                    {
                         Ok(watchdog) => {
                             let result = self.core.call_function_sync(fn_id, args, timeout_ms);
                             self.core
@@ -687,7 +767,7 @@ impl RuntimeDispatcher {
                 responder,
             } => {
                 if self.core.should_reject_new_work() {
-                    let _ = responder.send(Err(RuntimeError::terminated()));
+                    let _ = responder.send(Err(self.core.terminated_error()));
                     return false;
                 }
                 if let Err(err) = self.core.ensure_inspector_ready() {
@@ -719,7 +799,7 @@ impl RuntimeDispatcher {
                 responder,
             } => {
                 if self.core.should_reject_new_work() {
-                    let _ = responder.send(Err(RuntimeError::terminated()));
+                    let _ = responder.send(Err(self.core.terminated_error()));
                     return false;
                 }
                 if let Err(err) = self.core.ensure_inspector_ready() {
@@ -746,7 +826,7 @@ impl RuntimeDispatcher {
             }
             RuntimeCommand::ReleaseFunction { fn_id, responder } => {
                 let result = if self.core.should_reject_new_work() {
-                    Err(RuntimeError::terminated())
+                    Err(self.core.terminated_error())
                 } else {
                     self.core.release_function(fn_id)
                 };
@@ -758,7 +838,7 @@ impl RuntimeDispatcher {
                 responder,
             } => {
                 if self.core.should_reject_new_work() {
-                    let _ = responder.send(Err(RuntimeError::terminated()));
+                    let _ = responder.send(Err(self.core.terminated_error()));
                 } else {
                     let job = StreamReadJob::new(stream_id, responder);
                     if self.active_job.is_none() {
@@ -791,10 +871,11 @@ impl RuntimeDispatcher {
                 false
             }
             RuntimeCommand::Terminate { responder } => {
+                let termination_error = self.core.terminated_error();
                 // Cancel active job if exists
                 if let Some(job) = self.active_job.take() {
                     tracing::debug!("Terminating active job on interrupt");
-                    job.finish(&mut self.core, Err(RuntimeError::terminated()));
+                    job.finish(&mut self.core, Err(termination_error.clone()));
                 }
 
                 // Cancel all pending jobs
@@ -803,7 +884,7 @@ impl RuntimeDispatcher {
                     tracing::debug!(count = pending_count, "Cancelling pending jobs");
                 }
                 while let Some(job) = self.pending_jobs.pop_front() {
-                    job.finish(&mut self.core, Err(RuntimeError::terminated()));
+                    job.finish(&mut self.core, Err(termination_error.clone()));
                 }
 
                 // Clear task locals to prevent stale event loop references
@@ -837,9 +918,13 @@ impl RuntimeDispatcher {
     /// Handle the command channel closing without an explicit shutdown request.
     fn handle_channel_closed(&mut self) -> bool {
         tracing::warn!("Command channel closed without explicit shutdown - cleaning up");
+        self.core
+            .termination
+            .ensure_reason("Command channel closed unexpectedly");
+        let termination_error = self.core.terminated_error();
         if let Some(job) = self.active_job.take() {
             tracing::debug!("Dropping active job after command channel closed");
-            job.finish(&mut self.core, Err(RuntimeError::terminated()));
+            job.finish(&mut self.core, Err(termination_error.clone()));
         }
 
         if !self.pending_jobs.is_empty() {
@@ -849,7 +934,7 @@ impl RuntimeDispatcher {
             );
         }
         while let Some(job) = self.pending_jobs.pop_front() {
-            job.finish(&mut self.core, Err(RuntimeError::terminated()));
+            job.finish(&mut self.core, Err(termination_error.clone()));
         }
 
         self.core.clear_task_locals();
@@ -940,6 +1025,10 @@ impl RuntimeJob for EvalAsyncJob {
         // Check timeout first
         if let Some(deadline) = self.deadline {
             if Instant::now() >= deadline {
+                core.termination.ensure_reason(format!(
+                    "Asynchronous evaluation timed out after {}ms",
+                    self.timeout_ms.unwrap_or(0)
+                ));
                 core.termination.terminate_execution();
                 return Poll::Ready(Err(RuntimeError::timeout(format!(
                     "Evaluation timed out after {}ms (promise still pending)",
@@ -1241,6 +1330,10 @@ impl RuntimeJob for EvalModuleAsyncJob {
         // Check timeout
         if let Some(deadline) = self.deadline {
             if Instant::now() >= deadline {
+                core.termination.ensure_reason(format!(
+                    "Asynchronous module evaluation timed out after {}ms",
+                    self.timeout_ms.unwrap_or(0)
+                ));
                 core.termination.terminate_execution();
                 return Poll::Ready(Err(RuntimeError::timeout(format!(
                     "Module evaluation timed out after {}ms",
@@ -1284,7 +1377,7 @@ impl RuntimeJob for EvalModuleAsyncJob {
                     };
 
                 // Load module synchronously (module loading is inherently blocking in deno_core)
-                // This is consistent with eval_module_sync and doesn't prevent re-entrancy
+                // This is consistent with eval_module_sync and doesn't prevent re-entrance
                 // because the actual async work (promise resolution) happens in the Evaluating state
                 let module_id = futures::executor::block_on(
                     core.js_runtime.load_main_es_module(&module_specifier),
@@ -1345,7 +1438,7 @@ impl RuntimeJob for EvalModuleAsyncJob {
 
                 let stream_registry = core.js_stream_registry.clone();
                 let scope = &mut core.js_runtime.handle_scope();
-                let local = deno_core::v8::Local::new(scope, module_namespace);
+                let local = v8::Local::new(scope, module_namespace);
                 let value: v8::Local<'_, v8::Value> = local.into();
                 let result = RuntimeCoreState::value_to_js_value(
                     &fn_registry,
@@ -1442,6 +1535,10 @@ impl RuntimeJob for CallFunctionAsyncJob {
         // Check timeout
         if let Some(deadline) = self.deadline {
             if Instant::now() >= deadline {
+                core.termination.ensure_reason(format!(
+                    "Asynchronous function call timed out after {}ms",
+                    self.timeout_ms.unwrap_or(0)
+                ));
                 core.termination.terminate_execution();
                 return Poll::Ready(Err(RuntimeError::timeout(format!(
                     "Function call timed out after {}ms",
@@ -1480,11 +1577,11 @@ impl RuntimeJob for CallFunctionAsyncJob {
                         let (func, receiver) = {
                             let registry = core.fn_registry.borrow();
                             let stored = registry.get(&self.fn_id).unwrap(); // Safe: checked above
-                            let func = deno_core::v8::Local::new(&mut try_catch, &stored.function);
+                            let func = v8::Local::new(&mut try_catch, &stored.function);
                             let receiver = stored
                                 .receiver
                                 .as_ref()
-                                .map(|r| deno_core::v8::Local::new(&mut try_catch, r));
+                                .map(|r| v8::Local::new(&mut try_catch, r));
                             (func, receiver)
                         };
 
@@ -1660,6 +1757,10 @@ impl RuntimeJob for ResumeFunctionCallJob {
 
         if let Some(deadline) = self.deadline {
             if Instant::now() >= deadline {
+                core.termination.ensure_reason(format!(
+                    "Asynchronous function call timed out after {}ms",
+                    self.timeout_ms.unwrap_or(0)
+                ));
                 core.termination.terminate_execution();
                 return Poll::Ready(Err(RuntimeError::timeout(format!(
                     "Function call timed out after {}ms",
@@ -1745,7 +1846,7 @@ pub fn spawn_runtime_thread(config: RuntimeConfig) -> RuntimeResult<SpawnRuntime
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<RuntimeCommand>();
     let (init_tx, init_rx): InitSignalChannel = std::sync::mpsc::channel();
 
-    std::thread::Builder::new()
+    thread::Builder::new()
         .name("jsrun-deno-runtime".to_string())
         .spawn(move || {
             let _thread_guard = RuntimeThreadGuard::new();
@@ -1947,6 +2048,30 @@ impl RuntimeCoreState {
             TerminationController::new(handle)
         };
 
+        if let Some(heap_limit_bytes) = max_heap_size {
+            let termination_for_heap_limit = termination.clone();
+            js_runtime.add_near_heap_limit_callback(move |current_limit, initial_limit| {
+                termination_for_heap_limit.ensure_reason("Heap limit exceeded");
+                let first_request = termination_for_heap_limit.request();
+                if first_request {
+                    tracing::error!(
+                        configured_heap_limit = heap_limit_bytes,
+                        current_heap_limit = current_limit,
+                        initial_heap_limit = initial_limit,
+                        "V8 isolate is nearing its heap limit; terminating execution",
+                    );
+                }
+                termination_for_heap_limit.terminate_execution();
+
+                // Returning a slightly larger limit gives V8 enough breathing room to unwind
+                // after we terminate execution rather than letting it abort the process.
+                let extra_headroom = initial_limit
+                    .max(heap_limit_bytes / 8)
+                    .max(NEAR_HEAP_LIMIT_MIN_HEADROOM_BYTES);
+                current_limit.saturating_add(extra_headroom)
+            });
+        }
+
         let inspector_state = match inspector {
             Some(inspector_cfg) => {
                 let wait_for_connection = inspector_cfg.wait_for_connection;
@@ -2041,6 +2166,10 @@ impl RuntimeCoreState {
         self.terminated || self.termination.is_requested()
     }
 
+    fn terminated_error(&self) -> RuntimeError {
+        self.termination.terminated_error()
+    }
+
     /// Clear task locals after a job completes to prevent stale event loop references
     fn clear_task_locals(&mut self) {
         self.task_locals = None;
@@ -2123,20 +2252,23 @@ impl RuntimeCoreState {
             })
     }
 
-    fn start_sync_watchdog(&self) -> RuntimeResult<Option<SyncWatchdog>> {
+    fn start_sync_watchdog(&self, reason: &str) -> RuntimeResult<Option<SyncWatchdog>> {
         self.execution_timeout
-            .map(|duration| SyncWatchdog::spawn(duration, self.termination.clone()))
+            .map(|duration| {
+                SyncWatchdog::spawn(duration, self.termination.clone(), reason.to_string())
+            })
             .transpose()
     }
 
     fn start_timeout_watchdog(
         &self,
         timeout_ms: Option<u64>,
+        reason: &str,
     ) -> RuntimeResult<Option<SyncWatchdog>> {
         timeout_ms
             .map(|ms| {
                 let duration = Duration::from_millis(ms);
-                SyncWatchdog::spawn(duration, self.termination.clone())
+                SyncWatchdog::spawn(duration, self.termination.clone(), reason.to_string())
             })
             .transpose()
     }
@@ -2196,7 +2328,7 @@ impl RuntimeCoreState {
         let details = JsExceptionDetails::from_js_error(err);
         if self.should_reject_new_work() && Self::js_error_indicates_termination(&details) {
             let _ = self.finalize_termination();
-            RuntimeError::terminated()
+            self.terminated_error()
         } else {
             RuntimeError::javascript(details)
         }
@@ -2208,7 +2340,7 @@ impl RuntimeCoreState {
             && Self::runtime_error_indicates_termination(&runtime_error)
         {
             let _ = self.finalize_termination();
-            RuntimeError::terminated()
+            self.terminated_error()
         } else {
             runtime_error
         }
@@ -2220,7 +2352,7 @@ impl RuntimeCoreState {
             RuntimeError::Timeout { context } | RuntimeError::Internal { context } => {
                 context.contains("execution terminated")
             }
-            RuntimeError::Terminated => true,
+            RuntimeError::Terminated { .. } => true,
         }
     }
 
@@ -2395,7 +2527,7 @@ impl RuntimeCoreState {
             let limits = this.serialization_limits;
             let stream_registry = this.js_stream_registry.clone();
             let scope = &mut this.js_runtime.handle_scope();
-            let local = deno_core::v8::Local::new(scope, global_value);
+            let local = v8::Local::new(scope, global_value);
             Self::value_to_js_value(
                 &fn_registry,
                 &next_fn_id,
@@ -2469,9 +2601,8 @@ impl RuntimeCoreState {
             let limits = this.serialization_limits;
             let stream_registry = this.js_stream_registry.clone();
             let scope = &mut this.js_runtime.handle_scope();
-            let namespace_obj = deno_core::v8::Local::new(scope, module_namespace);
-            let namespace_value: deno_core::v8::Local<'_, deno_core::v8::Value> =
-                namespace_obj.into();
+            let namespace_obj = v8::Local::new(scope, module_namespace);
+            let namespace_value: v8::Local<'_, v8::Value> = namespace_obj.into();
             Self::value_to_js_value(
                 &fn_registry,
                 &next_fn_id,
@@ -2695,8 +2826,8 @@ impl RuntimeCoreState {
     fn value_to_js_value<'s>(
         fn_registry: &Rc<RefCell<HashMap<u32, StoredFunction>>>,
         next_fn_id: &Rc<RefCell<u32>>,
-        scope: &mut deno_core::v8::HandleScope<'s>,
-        value: deno_core::v8::Local<'s, deno_core::v8::Value>,
+        scope: &mut v8::HandleScope<'s>,
+        value: v8::Local<'s, v8::Value>,
         limits: SerializationLimits,
         stream_registry: Rc<JsStreamRegistry>,
     ) -> RuntimeResult<JSValue> {
@@ -2825,11 +2956,11 @@ impl RuntimeCoreState {
     fn value_to_js_value_internal<'s>(
         fn_registry: &Rc<RefCell<HashMap<u32, StoredFunction>>>,
         next_fn_id: &Rc<RefCell<u32>>,
-        scope: &mut deno_core::v8::HandleScope<'s>,
-        value: deno_core::v8::Local<'s, deno_core::v8::Value>,
+        scope: &mut v8::HandleScope<'s>,
+        value: v8::Local<'s, v8::Value>,
         seen: &mut HashSet<i32>,
         tracker: &mut LimitTracker,
-        receiver: Option<deno_core::v8::Global<deno_core::v8::Value>>,
+        receiver: Option<v8::Global<v8::Value>>,
         stream_registry: Rc<JsStreamRegistry>,
     ) -> RuntimeResult<JSValue> {
         tracker.enter()?;
@@ -2866,7 +2997,7 @@ impl RuntimeCoreState {
                 Ok(JSValue::Float(num_val))
             }
         } else if value.is_big_int() {
-            let bigint = deno_core::v8::Local::<deno_core::v8::BigInt>::try_from(value)
+            let bigint = v8::Local::<v8::BigInt>::try_from(value)
                 .map_err(|_| RuntimeError::internal("Failed to cast to BigInt"))?;
             let (int_value, lossless) = bigint.i64_value();
             if lossless {
@@ -2891,11 +3022,11 @@ impl RuntimeCoreState {
             Ok(JSValue::String(rust_str))
         } else if value.is_function() {
             // Register function and return proxy ID
-            let func = deno_core::v8::Local::<deno_core::v8::Function>::try_from(value)
+            let func = v8::Local::<v8::Function>::try_from(value)
                 .map_err(|_| RuntimeError::internal("Failed to cast to function"))?;
 
             // Create a Global handle to keep the function alive
-            let fn_handle = deno_core::v8::Global::new(scope, func);
+            let fn_handle = v8::Global::new(scope, func);
 
             // Register in the function registry
             let mut registry = fn_registry.borrow_mut();
@@ -2917,16 +3048,16 @@ impl RuntimeCoreState {
         } else if value.is_symbol() {
             Err(RuntimeError::internal("Cannot serialize V8 symbol"))
         } else if value.is_uint8_array() {
-            let typed_array = deno_core::v8::Local::<deno_core::v8::Uint8Array>::try_from(value)
+            let typed_array = v8::Local::<v8::Uint8Array>::try_from(value)
                 .map_err(|_| RuntimeError::internal("Failed to cast to Uint8Array"))?;
             let length = typed_array.byte_length();
             tracker.add_bytes(length)?;
             let mut buffer = vec![0u8; length];
-            let view: deno_core::v8::Local<deno_core::v8::ArrayBufferView> = typed_array.into();
+            let view: v8::Local<v8::ArrayBufferView> = typed_array.into();
             view.copy_contents(&mut buffer);
             Ok(JSValue::Bytes(buffer))
         } else if value.is_array_buffer() {
-            let array_buffer = deno_core::v8::Local::<deno_core::v8::ArrayBuffer>::try_from(value)
+            let array_buffer = v8::Local::<v8::ArrayBuffer>::try_from(value)
                 .map_err(|_| RuntimeError::internal("Failed to cast to ArrayBuffer"))?;
             let length = array_buffer.byte_length();
             tracker.add_bytes(length)?;
@@ -2945,7 +3076,7 @@ impl RuntimeCoreState {
             Ok(JSValue::Bytes(buffer))
         } else if value.is_array() {
             // Check for circular reference using identity hash
-            let obj = deno_core::v8::Local::<deno_core::v8::Object>::try_from(value)
+            let obj = v8::Local::<v8::Object>::try_from(value)
                 .map_err(|_| RuntimeError::internal("Failed to cast array to object"))?;
             let hash = obj.get_identity_hash().get();
 
@@ -2955,7 +3086,7 @@ impl RuntimeCoreState {
                 ));
             }
 
-            let array = deno_core::v8::Local::<deno_core::v8::Array>::try_from(value)
+            let array = v8::Local::<v8::Array>::try_from(value)
                 .map_err(|_| RuntimeError::internal("Failed to cast to array"))?;
             let len = array.length() as usize;
 
@@ -2980,7 +3111,7 @@ impl RuntimeCoreState {
             seen.remove(&hash);
             Ok(JSValue::Array(items))
         } else if value.is_set() {
-            let obj = deno_core::v8::Local::<deno_core::v8::Object>::try_from(value)
+            let obj = v8::Local::<v8::Object>::try_from(value)
                 .map_err(|_| RuntimeError::internal("Failed to cast set to object"))?;
             let hash = obj.get_identity_hash().get();
 
@@ -2990,13 +3121,13 @@ impl RuntimeCoreState {
                 ));
             }
 
-            let set = deno_core::v8::Local::<deno_core::v8::Set>::try_from(value)
+            let set = v8::Local::<v8::Set>::try_from(value)
                 .map_err(|_| RuntimeError::internal("Failed to cast to Set"))?;
             let entries = set.as_array(scope);
             let len = entries.length() as usize;
 
             tracker.add_bytes(24)?;
-            tracker.add_bytes(len.saturating_mul(std::mem::size_of::<usize>()))?;
+            tracker.add_bytes(len.saturating_mul(size_of::<usize>()))?;
 
             let mut values = Vec::with_capacity(len);
             for index in 0..len {
@@ -3018,7 +3149,7 @@ impl RuntimeCoreState {
             seen.remove(&hash);
             Ok(JSValue::Set(values))
         } else if value.is_date() {
-            let date = deno_core::v8::Local::<deno_core::v8::Date>::try_from(value)
+            let date = v8::Local::<v8::Date>::try_from(value)
                 .map_err(|_| RuntimeError::internal("Failed to cast to Date"))?;
             let epoch_ms = date.value_of();
             if !epoch_ms.is_finite() || epoch_ms < i64::MIN as f64 || epoch_ms > i64::MAX as f64 {
@@ -3028,11 +3159,11 @@ impl RuntimeCoreState {
             Ok(JSValue::Date(epoch_ms.round() as i64))
         } else if value.is_object() && Self::is_readable_stream(scope, value) {
             let stream_id = stream_registry.register_stream(scope, value);
-            tracker.add_bytes(std::mem::size_of::<u32>())?;
+            tracker.add_bytes(size_of::<u32>())?;
             Ok(JSValue::JsStream { id: stream_id })
         } else if value.is_object() {
             // Check for circular reference using identity hash
-            let obj = deno_core::v8::Local::<deno_core::v8::Object>::try_from(value)
+            let obj = v8::Local::<v8::Object>::try_from(value)
                 .map_err(|_| RuntimeError::internal("Failed to cast to object"))?;
             let hash = obj.get_identity_hash().get();
 
@@ -3044,7 +3175,7 @@ impl RuntimeCoreState {
 
             // Get property names
             let prop_names = obj
-                .get_own_property_names(scope, deno_core::v8::GetPropertyNamesArgs::default())
+                .get_own_property_names(scope, v8::GetPropertyNamesArgs::default())
                 .ok_or_else(|| RuntimeError::internal("Failed to get property names"))?;
 
             let mut map = IndexMap::new();
@@ -3063,8 +3194,8 @@ impl RuntimeCoreState {
 
                 // If the value is a function, capture the object as the receiver for 'this' binding
                 let receiver_for_val = if val.is_function() {
-                    let obj_as_value: deno_core::v8::Local<deno_core::v8::Value> = obj.into();
-                    Some(deno_core::v8::Global::new(scope, obj_as_value))
+                    let obj_as_value: v8::Local<v8::Value> = obj.into();
+                    Some(v8::Global::new(scope, obj_as_value))
                 } else {
                     None
                 };
@@ -3124,7 +3255,7 @@ mod tests {
             if active_runtime_threads() == baseline {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(10));
+            thread::sleep(Duration::from_millis(10));
         }
 
         assert_eq!(

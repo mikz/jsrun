@@ -3,7 +3,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use std::time::Duration;
 
-fn validate_timeout_seconds(seconds: f64) -> PyResult<()> {
+pub(crate) fn validate_timeout_seconds(seconds: f64) -> PyResult<()> {
     if !seconds.is_finite() {
         return Err(PyValueError::new_err("Timeout must be finite"));
     }
@@ -19,9 +19,7 @@ fn validate_timeout_seconds(seconds: f64) -> PyResult<()> {
     Ok(())
 }
 
-pub(crate) fn normalize_timeout_to_ms<'py>(
-    timeout: Option<&Bound<'py, PyAny>>,
-) -> PyResult<Option<u64>> {
+pub(crate) fn normalize_timeout_to_ms(timeout: Option<&Bound<PyAny>>) -> PyResult<Option<u64>> {
     let Some(timeout_value) = timeout else {
         return Ok(None);
     };
@@ -30,17 +28,12 @@ pub(crate) fn normalize_timeout_to_ms<'py>(
         validate_timeout_seconds(seconds)?;
         Duration::from_secs_f64(seconds)
     } else if let Ok(seconds) = timeout_value.extract::<u64>() {
-        if seconds == 0 {
-            return Err(PyValueError::new_err("Timeout cannot be zero"));
-        }
+        let seconds_f64 = seconds as f64;
+        validate_timeout_seconds(seconds_f64)?;
         Duration::from_secs(seconds)
     } else if let Ok(seconds) = timeout_value.extract::<i64>() {
-        if seconds < 0 {
-            return Err(PyValueError::new_err("Timeout cannot be negative"));
-        }
-        if seconds == 0 {
-            return Err(PyValueError::new_err("Timeout cannot be zero"));
-        }
+        let seconds_f64 = seconds as f64;
+        validate_timeout_seconds(seconds_f64)?;
         Duration::from_secs(seconds as u64)
     } else {
         let py = timeout_value.py();

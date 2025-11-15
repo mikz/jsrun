@@ -188,14 +188,11 @@ fn python_to_js_value_internal(
     let result = if obj.is_none() {
         add_bytes(4, tracker)?;
         Ok(JSValue::Null)
-    } else if obj
-        .extract::<pyo3::PyRef<super::python::JsUndefined>>()
-        .is_ok()
-    {
+    } else if obj.extract::<PyRef<super::python::JsUndefined>>().is_ok() {
         add_bytes(0, tracker)?;
         Ok(JSValue::Undefined)
-    } else if let Ok(stream) = obj.extract::<pyo3::PyRef<PyStreamSource>>() {
-        add_bytes(std::mem::size_of::<u32>(), tracker)?;
+    } else if let Ok(stream) = obj.extract::<PyRef<PyStreamSource>>() {
+        add_bytes(size_of::<u32>(), tracker)?;
         let stream_id = stream.stream_id_for_transfer()?;
         Ok(JSValue::PyStream { id: stream_id })
     } else if let Ok(py_bytes) = obj.cast::<PyBytes>() {
@@ -220,10 +217,7 @@ fn python_to_js_value_internal(
         }
 
         add_bytes(16, tracker)?;
-        add_bytes(
-            list.len().saturating_mul(std::mem::size_of::<usize>()),
-            tracker,
-        )?;
+        add_bytes(list.len().saturating_mul(size_of::<usize>()), tracker)?;
 
         let mut items = Vec::with_capacity(list.len());
         for item in list.iter() {
@@ -246,10 +240,7 @@ fn python_to_js_value_internal(
         }
 
         add_bytes(24, tracker)?;
-        add_bytes(
-            dict.len().saturating_mul(std::mem::size_of::<usize>() * 2),
-            tracker,
-        )?;
+        add_bytes(dict.len().saturating_mul(size_of::<usize>() * 2), tracker)?;
 
         let mut map = IndexMap::with_capacity(dict.len());
         for (key, value) in dict.iter() {
@@ -272,10 +263,7 @@ fn python_to_js_value_internal(
         }
 
         add_bytes(24, tracker)?;
-        add_bytes(
-            py_set.len().saturating_mul(std::mem::size_of::<usize>()),
-            tracker,
-        )?;
+        add_bytes(py_set.len().saturating_mul(size_of::<usize>()), tracker)?;
 
         let mut items = Vec::with_capacity(py_set.len());
         for item in py_set.iter() {
@@ -299,9 +287,7 @@ fn python_to_js_value_internal(
 
         add_bytes(24, tracker)?;
         add_bytes(
-            py_frozenset
-                .len()
-                .saturating_mul(std::mem::size_of::<usize>()),
+            py_frozenset.len().saturating_mul(size_of::<usize>()),
             tracker,
         )?;
 
@@ -352,14 +338,14 @@ fn python_to_js_value_internal(
         add_bytes(1, tracker)?;
         Ok(JSValue::Bool(b))
     } else if let Ok(i) = obj.extract::<i64>() {
-        add_bytes(std::mem::size_of::<i64>(), tracker)?;
+        add_bytes(size_of::<i64>(), tracker)?;
         Ok(JSValue::Int(i))
     } else if let Ok(bigint) = obj.extract::<BigInt>() {
         let (_, magnitude) = bigint.to_bytes_le();
         add_bytes(magnitude.len(), tracker)?;
         Ok(JSValue::BigInt(bigint))
     } else if let Ok(f) = obj.extract::<f64>() {
-        add_bytes(std::mem::size_of::<f64>(), tracker)?;
+        add_bytes(size_of::<f64>(), tracker)?;
         Ok(JSValue::Float(f))
     } else if let Ok(s) = obj.extract::<String>() {
         if s.len() > limits.max_bytes {
@@ -372,7 +358,7 @@ fn python_to_js_value_internal(
         add_bytes(s.len(), tracker)?;
         add_bytes(16, tracker)?;
         Ok(JSValue::String(s))
-    } else if let Ok(js_fn) = obj.extract::<pyo3::PyRef<super::python::JsFunction>>() {
+    } else if let Ok(js_fn) = obj.extract::<PyRef<super::python::JsFunction>>() {
         // JsFunction proxy - extract the function ID for round-trip
         // This validates that the function is not closed and runtime is alive
         let id = js_fn.function_id_for_transfer()?;

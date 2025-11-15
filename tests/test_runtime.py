@@ -403,13 +403,15 @@ class TestRuntimeTermination:
         killer = asyncio.create_task(kill_runtime())
 
         try:
-            with pytest.raises(RuntimeTerminated):
+            with pytest.raises(RuntimeTerminated) as async_exc:
                 await runtime.eval_async("while (true) {}")
 
             assert runtime.is_closed()
+            assert "host request" in str(async_exc.value).lower()
 
-            with pytest.raises(RuntimeTerminated):
+            with pytest.raises(RuntimeTerminated) as sync_exc:
                 runtime.eval("1 + 1")
+            assert "host request" in str(sync_exc.value).lower()
         finally:
             await killer
             runtime.close()
@@ -446,10 +448,46 @@ class TestRuntimeTermination:
             runtime.terminate()
             assert runtime.is_closed()
 
-            with pytest.raises(RuntimeTerminated):
+            with pytest.raises(RuntimeTerminated) as exc_info:
                 runtime.eval("2 + 2")
+            assert "host request" in str(exc_info.value).lower()
 
             runtime.terminate()  # Idempotent
+        finally:
+            runtime.close()
+
+
+class TestRuntimeHeapLimits:
+    """Ensure configured heap limits terminate runtimes before V8 aborts."""
+
+    def test_sync_eval_triggers_heap_termination(self):
+        config = RuntimeConfig(
+            max_heap_size=8 * 1024 * 1024, initial_heap_size=2 * 1024 * 1024
+        )
+        runtime = Runtime(config)
+        try:
+            with pytest.raises(RuntimeTerminated) as exc_info:
+                runtime.eval(
+                    "const allocations = []; while (true) { allocations.push(new Uint8Array(256 * 1024)); }"
+                )
+            assert runtime.is_closed()
+            assert "heap limit" in str(exc_info.value).lower()
+        finally:
+            runtime.close()
+
+    @pytest.mark.asyncio
+    async def test_async_eval_triggers_heap_termination(self):
+        config = RuntimeConfig(
+            max_heap_size=8 * 1024 * 1024, initial_heap_size=2 * 1024 * 1024
+        )
+        runtime = Runtime(config)
+        try:
+            with pytest.raises(RuntimeTerminated) as exc_info:
+                await runtime.eval_async(
+                    "const allocations = []; while (true) { allocations.push(new Uint8Array(256 * 1024)); }"
+                )
+            assert runtime.is_closed()
+            assert "heap limit" in str(exc_info.value).lower()
         finally:
             runtime.close()
 
@@ -839,7 +877,7 @@ class TestRuntimeTimeout:
             assert "timed out" in str(exc_info.value)
 
     def test_eval_sync_completes_before_timeout(self):
-        """Operations that complete quickly should not timeout."""
+        """Operations that complete quickly should not time out."""
         config = RuntimeConfig(timeout=1.0)
         with Runtime(config) as runtime:
             result = runtime.eval("2 + 2")

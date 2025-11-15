@@ -123,7 +123,9 @@ asyncio.run(main())
     If you're already in an async Python function, use [`eval_async()`][jsrun.Runtime.eval_async]. It won't block your event loop and handles Promises naturally.
 
 
-## Timeouts
+## Resource Limits
+
+### Timeouts
 
 Long-running JavaScript can be limited with timeouts:
 
@@ -136,8 +138,9 @@ async def main():
                 "while(true) {}",  # Infinite loop
                 timeout=1.0
             )
-        except TimeoutError:
-            print("JavaScript took too long!")
+        except RuntimeError as e:
+            if "timed out" in str(e).lower():
+                print("JavaScript took too long!")
 
 asyncio.run(main())
 ```
@@ -146,6 +149,34 @@ The timeout is specified in seconds (float). Without a timeout, infinite loops w
 
 !!! warning "Always set timeouts for untrusted code"
     If you're running user-provided JavaScript, always set a reasonable timeout to prevent resource exhaustion.
+
+### Memory Limits
+
+You can limit the JavaScript heap size to prevent excessive memory usage:
+
+```python
+from jsrun import Runtime, RuntimeConfig
+
+config = RuntimeConfig(max_heap_size=10 * 1024 * 1024)  # 10MB limit
+
+with Runtime(config) as runtime:
+    try:
+        # This will fail if it tries to allocate more than 10MB
+        runtime.eval("""
+            const huge = [];
+            for (let i = 0; i < 10_000_000; i++) {
+                huge.push({ data: 'x'.repeat(100) });
+            }
+        """)
+    except RuntimeError as e:
+        print(f"Out of memory: {e}")
+        # Out of memory: Evaluation failed: Heap limit exceeded
+```
+
+When JavaScript code exceeds the configured heap limit, the runtime terminates and raises a `RuntimeError` with the message "Heap limit exceeded".
+
+!!! warning "Set memory limits for untrusted code"
+    Always configure `max_heap_size` when running untrusted JavaScript to prevent memory exhaustion attacks. The runtime will terminate gracefully when the limit is reached.
 
 ## Error Handling
 

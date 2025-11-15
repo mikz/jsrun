@@ -21,18 +21,28 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// Execution mode for Python handlers.
+/// Execution mode for Python op handlers.
+///
+/// Determines whether the Python callable is synchronous or asynchronous.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PythonOpMode {
+    /// Synchronous Python function (returns value directly).
     Sync,
+    /// Asynchronous Python function (returns awaitable/coroutine).
     Async,
 }
 
 /// Metadata for a registered Python op.
+///
+/// Stores the handler callable and its execution mode for op invocations from JavaScript.
 pub struct PythonOpEntry {
+    /// Unique op identifier.
     pub id: u32,
+    /// Human-readable op name.
     pub name: String,
+    /// Sync or async execution mode.
     pub mode: PythonOpMode,
+    /// Python callable (function or bound method).
     pub handler: Py<PyAny>,
 }
 
@@ -58,6 +68,9 @@ struct PythonOpRegistryInner {
 }
 
 /// Thread-safe registry of Python operations.
+///
+/// Manages dynamic registration and lookup of Python callables that can be invoked
+/// from JavaScript via `op_jsrun_call_python_sync` and `op_jsrun_call_python_async`.
 #[derive(Clone, Default)]
 pub struct PythonOpRegistry {
     inner: Arc<PythonOpRegistryInner>,
@@ -68,6 +81,9 @@ impl PythonOpRegistry {
         Self::default()
     }
 
+    /// Register a Python callable as an op.
+    ///
+    /// Returns a unique op ID that can be used to invoke the handler from JavaScript.
     pub fn register(&self, name: String, mode: PythonOpMode, handler: Py<PyAny>) -> u32 {
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let entry = PythonOpEntry {
@@ -107,6 +123,10 @@ fn map_pyerr(err: PyErr) -> JsErrorBox {
     JsErrorBox::type_error(err.to_string())
 }
 
+/// Deno op for synchronously calling a Python handler from JavaScript.
+///
+/// Looks up the registered Python op by ID, serializes JS arguments to Python,
+/// invokes the handler, and returns the result as a JSValue.
 #[op2]
 #[serde]
 fn op_jsrun_call_python_sync(
@@ -140,6 +160,11 @@ fn op_jsrun_call_python_sync(
     })
 }
 
+/// Deno op for asynchronously calling a Python handler from JavaScript.
+///
+/// Returns a future that polls the Python coroutine using the asyncio event loop
+/// from the TaskLocals stored in OpState. This enables Python async functions to
+/// be awaited from JavaScript.
 #[op2(async)]
 #[serde]
 fn op_jsrun_call_python_async(
@@ -187,7 +212,7 @@ fn op_jsrun_call_python_async(
     })?;
 
     // Use into_future_with_locals to properly await the Python coroutine
-    // This allows the Rust future to be suspended and resumed, enabling re-entrancy
+    // This allows the Rust future to be suspended and resumed, enabling re-entrance
     let task_locals = global_locals
         .0
         .ok_or_else(|| JsErrorBox::type_error("TaskLocals not available for async op"))?;

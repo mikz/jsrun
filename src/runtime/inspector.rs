@@ -447,7 +447,7 @@ struct InspectorInfoConfig {
 impl InspectorInfo {
     fn new(
         host: SocketAddr,
-        new_session_tx: mpsc::UnboundedSender<InspectorSessionProxy>,
+        new_session_tx: UnboundedSender<InspectorSessionProxy>,
         deregister_rx: oneshot::Receiver<()>,
         inspector_cfg: InspectorInfoConfig,
     ) -> Self {

@@ -9,19 +9,31 @@ use pyo3::prelude::*;
 use pyo3_async_runtimes::TaskLocals;
 use std::cell::RefCell;
 
+/// Internal state for the Python module loader.
 #[derive(Default)]
 struct LoaderInner {
+    /// Pre-registered static modules (name -> source).
     static_modules: std::collections::HashMap<String, String>,
+    /// Optional Python resolver callable.
     resolver: Option<Py<PyAny>>,
+    /// Optional Python loader callable.
     loader: Option<Py<PyAny>>,
 }
 
+/// Module loader that delegates resolution and loading to Python callables.
+///
+/// Implements `deno_core::ModuleLoader` to enable custom module resolution and loading
+/// logic written in Python. Supports static modules registered at runtime and dynamic
+/// resolution via Python callbacks.
 pub struct PythonModuleLoader {
+    /// Internal state (static modules, resolver/loader callbacks).
     inner: RefCell<LoaderInner>,
+    /// Asyncio task locals for async module loading.
     task_locals: RefCell<Option<TaskLocals>>,
 }
 
 impl PythonModuleLoader {
+    /// Create a new Python module loader.
     pub fn new() -> Self {
         Self {
             inner: RefCell::new(LoaderInner::default()),
@@ -29,26 +41,44 @@ impl PythonModuleLoader {
         }
     }
 
+    /// Set a Python resolver callable for custom module resolution.
+    ///
+    /// The resolver receives `(specifier, referrer)` and returns a resolved URL string
+    /// or `None` to fall back to static modules.
     pub fn set_resolver(&self, resolver: Py<PyAny>) {
         self.inner.borrow_mut().resolver = Some(resolver);
     }
 
+    /// Set a Python loader callable for fetching module source.
+    ///
+    /// The loader receives a resolved specifier and returns the module source code.
     pub fn set_loader(&self, loader: Py<PyAny>) {
         self.inner.borrow_mut().loader = Some(loader);
     }
 
+    /// Register a static module with pre-defined source.
+    ///
+    /// Static modules are resolved using `jsrun://static/<name>` URLs and do not
+    /// require a custom loader.
     pub fn add_static_module(&self, name: String, source: String) {
         self.inner.borrow_mut().static_modules.insert(name, source);
     }
 
+    /// Set asyncio task locals for async module loading.
+    ///
+    /// Required when using async module loaders to provide the event loop context.
     pub fn set_task_locals(&self, task_locals: TaskLocals) {
         *self.task_locals.borrow_mut() = Some(task_locals);
     }
 
+    /// Clear the asyncio task locals.
     pub fn clear_task_locals(&self) {
         *self.task_locals.borrow_mut() = None;
     }
 
+    /// Resolve a static module specifier to a jsrun:// URL.
+    ///
+    /// Returns `None` if the module is not registered as a static module.
     fn resolve_static(&self, specifier: &str) -> Option<String> {
         // Strip "static:" prefix if present
         let bare_specifier = specifier.strip_prefix("static:").unwrap_or(specifier);
@@ -69,6 +99,15 @@ impl PythonModuleLoader {
 }
 
 impl ModuleLoader for PythonModuleLoader {
+    /// Resolve a module specifier to a URL.
+    ///
+    /// Resolution order:
+    /// 1. Custom Python resolver (if set) - returns URL or None
+    /// 2. Static modules - checks registry for pre-registered modules
+    /// 3. Error if no resolution method succeeds
+    ///
+    /// # Errors
+    /// Returns an error if resolution fails or the resolver throws.
     fn resolve(
         &self,
         specifier: &str,
@@ -99,16 +138,16 @@ impl ModuleLoader for PythonModuleLoader {
                 // Check if the result is None
                 if result.is_none(py) {
                     // Python returned None, fall back to static resolution
-                    if let Some(static_spec) = self.resolve_static(actual_specifier) {
-                        return ModuleSpecifier::parse(&static_spec)
-                            .map_err(|e| JsErrorBox::new("URIError", e.to_string()));
+                    return if let Some(static_spec) = self.resolve_static(actual_specifier) {
+                        ModuleSpecifier::parse(&static_spec)
+                            .map_err(|e| JsErrorBox::new("URIError", e.to_string()))
                     } else {
                         // Fallback failed, deny
-                        return Err(JsErrorBox::new(
+                        Err(JsErrorBox::new(
                             "Error",
                             format!("Module resolution denied for {}. Resolver returned None and no static module was found.", actual_specifier)
-                        ));
-                    }
+                        ))
+                    };
                 }
 
                 // Python returned a string
@@ -121,16 +160,16 @@ impl ModuleLoader for PythonModuleLoader {
 
                 // Empty string also means fall back to static resolution
                 if resolved_str.is_empty() {
-                    if let Some(static_spec) = self.resolve_static(actual_specifier) {
-                        return ModuleSpecifier::parse(&static_spec)
-                            .map_err(|e| JsErrorBox::new("URIError", e.to_string()));
+                    return if let Some(static_spec) = self.resolve_static(actual_specifier) {
+                        ModuleSpecifier::parse(&static_spec)
+                            .map_err(|e| JsErrorBox::new("URIError", e.to_string()))
                     } else {
                         // Fallback failed, deny
-                        return Err(JsErrorBox::new(
+                        Err(JsErrorBox::new(
                             "Error",
                             format!("Module resolution denied for {}. Resolver returned empty string and no static module was found.", actual_specifier)
-                        ));
-                    }
+                        ))
+                    };
                 }
 
                 ModuleSpecifier::parse(&resolved_str)
@@ -153,6 +192,17 @@ impl ModuleLoader for PythonModuleLoader {
         }
     }
 
+    /// Load module source code for a resolved URL.
+    ///
+    /// Loading order:
+    /// 1. Static modules (jsrun://static/...) - returns immediately from registry
+    /// 2. Custom Python loader (if set) - calls loader with specifier
+    ///    - Supports both sync and async loaders
+    ///    - Async loaders require task_locals to be set
+    /// 3. Error if no loader is available
+    ///
+    /// # Errors
+    /// Returns an error if loading fails or loader throws.
     fn load(
         &self,
         module_specifier: &deno_core::url::Url,

@@ -4,6 +4,7 @@
 //! including heap limits and bootstrap options.
 
 use crate::runtime::js_value::{SerializationLimits, MAX_JS_BYTES, MAX_JS_DEPTH};
+use crate::runtime::python::utils::validate_timeout_seconds;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use std::net::SocketAddr;
@@ -30,14 +31,23 @@ fn parse_socket_addr(host: &str, port: u16) -> PyResult<SocketAddr> {
     })
 }
 
-/// Inspector configuration shared between Rust and Python.
+/// Inspector configuration for Chrome DevTools Protocol debugging.
+///
+/// Configures the WebSocket server that enables debugging via Chrome DevTools
+/// or compatible debuggers. The inspector runs on a separate thread from the
+/// runtime thread.
 #[pyclass(module = "jsrun")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InspectorConfig {
+    /// Socket address (IP and port) for the inspector server.
     pub address: SocketAddr,
+    /// If true, runtime waits for debugger connection before executing code.
     pub wait_for_connection: bool,
+    /// If true, execution pauses at the first statement for debugging.
     pub break_on_next_statement: bool,
+    /// Optional target URL identifier (e.g., module name or script path).
     pub target_url: Option<String>,
+    /// Optional display name shown in DevTools (e.g., "Main Runtime").
     pub display_name: Option<String>,
 }
 
@@ -157,35 +167,38 @@ impl InspectorConfig {
 }
 
 /// Runtime configuration for a single JavaScript isolate.
+///
+/// Defines heap limits, optional bootstrap code, inspector settings, and
+/// serialization constraints for a V8 runtime instance.
 #[pyclass(module = "jsrun")]
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // Exposed to Python bindings; some fields are not wired yet in Rust.
 pub struct RuntimeConfig {
-    /// Maximum heap size in bytes (None = V8 default)
+    /// Maximum heap size in bytes (None = V8 default ~1.4 GB).
     pub max_heap_size: Option<usize>,
 
-    /// Initial heap size in bytes (None = V8 default)
+    /// Initial heap size in bytes (None = V8 default).
     pub initial_heap_size: Option<usize>,
 
-    /// Optional timeout for script execution
+    /// Optional timeout for script execution.
     pub execution_timeout: Option<Duration>,
 
-    /// Bootstrap script to run on startup
+    /// Bootstrap script to execute on startup (before user code).
     pub bootstrap_script: Option<String>,
 
-    /// Enable console output (default: true)
+    /// Enable console.log/error output (default: true).
     pub enable_console: Option<bool>,
 
-    /// Optional inspector configuration.
+    /// Optional inspector configuration for debugging.
     pub inspector: Option<InspectorConfig>,
 
-    /// Startup snapshot bytes.
+    /// Startup snapshot bytes for faster initialization.
     pub snapshot: Option<Vec<u8>>,
 
-    /// Maximum serialization depth for Python<->JS value transfers.
+    /// Maximum nesting depth for Python<->JS value serialization.
     pub max_serialization_depth: usize,
 
-    /// Maximum serialized byte size for Python<->JS value transfers.
+    /// Maximum serialized payload size for Python<->JS transfers (bytes).
     pub max_serialization_bytes: usize,
 }
 
@@ -206,42 +219,21 @@ impl Default for RuntimeConfig {
 }
 
 impl RuntimeConfig {
-    fn validate_timeout_seconds(seconds: f64) -> PyResult<()> {
-        if !seconds.is_finite() {
-            return Err(PyValueError::new_err("Timeout must be finite"));
-        }
-        if seconds < 0.0 {
-            return Err(PyValueError::new_err("Timeout cannot be negative"));
-        }
-        if seconds == 0.0 {
-            return Err(PyValueError::new_err("Timeout cannot be zero"));
-        }
-        if seconds > u64::MAX as f64 {
-            return Err(PyValueError::new_err("Timeout is too large"));
-        }
-        Ok(())
-    }
-
     fn duration_from_py_timeout(timeout_value: &Bound<'_, PyAny>) -> PyResult<Duration> {
         if let Ok(seconds) = timeout_value.extract::<f64>() {
-            Self::validate_timeout_seconds(seconds)?;
+            validate_timeout_seconds(seconds)?;
             return Ok(Duration::from_secs_f64(seconds));
         }
 
         if let Ok(seconds) = timeout_value.extract::<u64>() {
-            if seconds == 0 {
-                return Err(PyValueError::new_err("Timeout cannot be zero"));
-            }
+            let seconds_f64 = seconds as f64;
+            validate_timeout_seconds(seconds_f64)?;
             return Ok(Duration::from_secs(seconds));
         }
 
         if let Ok(seconds) = timeout_value.extract::<i64>() {
-            if seconds < 0 {
-                return Err(PyValueError::new_err("Timeout cannot be negative"));
-            }
-            if seconds == 0 {
-                return Err(PyValueError::new_err("Timeout cannot be zero"));
-            }
+            let seconds_f64 = seconds as f64;
+            validate_timeout_seconds(seconds_f64)?;
             return Ok(Duration::from_secs(seconds as u64));
         }
 
@@ -249,7 +241,7 @@ impl RuntimeConfig {
         let timedelta = py.import("datetime")?.getattr("timedelta")?;
         if timeout_value.is_instance(&timedelta)? {
             let total_seconds: f64 = timeout_value.getattr("total_seconds")?.call0()?.extract()?;
-            Self::validate_timeout_seconds(total_seconds)?;
+            validate_timeout_seconds(total_seconds)?;
             Ok(Duration::from_secs_f64(total_seconds))
         } else {
             Err(PyValueError::new_err(

@@ -36,7 +36,7 @@ async def main() -> None:
         namespace = await rt.eval_module_async("entry")
         summary = namespace["summary"]
         print("Answer:", summary["answer"])  # -> 42
-        print("Message:", summary["text"])    # -> Hello from custom loader
+        print("Message:", summary["text"])  # -> Hello from custom loader
 
 
 if __name__ == "__main__":

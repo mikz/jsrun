@@ -69,10 +69,14 @@ fn runtime_error_to_py_with(py: Python<'_>, err: RuntimeError, context: Option<&
             };
             PyRuntimeError::new_err(message)
         }
-        RuntimeError::Terminated => {
+        RuntimeError::Terminated { reason } => {
+            let base = reason
+                .as_deref()
+                .filter(|msg| !msg.is_empty())
+                .unwrap_or("Runtime terminated");
             let message = match context {
-                Some(prefix) if !prefix.is_empty() => format!("{prefix}: Runtime terminated"),
-                _ => "Runtime terminated".to_string(),
+                Some(prefix) if !prefix.is_empty() => format!("{prefix}: {base}"),
+                _ => base.to_string(),
             };
             PyErr::new::<RuntimeTerminated, _>(message)
         }

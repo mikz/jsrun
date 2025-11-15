@@ -1,36 +1,47 @@
 """
-Minimal example showing how to debug jsrun code via the Chrome DevTools inspector.
+Debug jsrun code via Chrome DevTools inspector.
 
-Run this file, copy the devtools:// URL that is printed, and paste it into Chrome.
-Execution will pause until the debugger attaches; hit the play button (or run
-`Runtime.runIfWaitingForDebugger` in the DevTools console) to continue.
+This example demonstrates waiting for the debugger to attach before executing code.
+This is useful for debugging initialization code or when you want to step through
+from the very beginning.
+
+Run this file, then open the chrome://inspect URL in Chrome to debug JavaScript execution.
 """
 
 from jsrun import InspectorConfig, Runtime, RuntimeConfig
 
 
 def main() -> None:
-    config = RuntimeConfig(inspector=InspectorConfig(display_name="Inspector Example", wait_for_connection=True))
+    """Demonstrate Chrome DevTools inspector integration."""
+    print("=== Inspector Example ===\n")
+
+    config = RuntimeConfig(
+        inspector=InspectorConfig(
+            display_name="jsrun Inspector Demo",
+            wait_for_connection=True,  # Pause until debugger connects
+        )
+    )
 
     with Runtime(config) as runtime:
         endpoints = runtime.inspector_endpoints()
         if not endpoints:
             raise RuntimeError("Inspector is not enabled for this runtime")
 
-        print("Inspector websocket:", endpoints.websocket_url)
-        print("Chrome DevTools URL:", endpoints.devtools_frontend_url)
-        print("\nAttach Chrome DevTools using either:")
-        print("  - Open the devtools:// URL above in Chrome")
-        print("  - Or use chrome://inspect and click 'inspect' under 'Remote Target'")
-        print("\nWaiting for debugger... (will block on first eval until you click Resume/F8)\n")
+        print("Open the chrome://inspect URL in Chrome to debug.")
+        print("Waiting for debugger to attach...")
 
+        # This will block until debugger connects and you click Resume
         runtime.eval("globalThis.counter = 0;")
-        print("Debugger attached! Running demo code...\n")
-        for _ in range(3):
-            print("counter ->", runtime.eval("++counter"))
 
-        print("Triggering a manual breakpoint via `debugger;`")
-        runtime.eval("debugger; counter += 1; counter;")
+        print("Debugger attached! Running code...\n")
+        for i in range(3):
+            result = runtime.eval("++counter")
+            print(f"counter -> {result}")
+
+        print("\nTriggering manual breakpoint with 'debugger;' statement...")
+        runtime.eval("debugger; counter += 10; counter;")
+
+        print("Done!\n")
 
 
 if __name__ == "__main__":

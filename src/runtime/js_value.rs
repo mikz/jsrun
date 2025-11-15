@@ -162,7 +162,7 @@ impl<'de> Deserialize<'de> for JSValue {
 
         struct JSValueVisitor;
 
-        impl<'de> serde::de::Visitor<'de> for JSValueVisitor {
+        impl<'de> de::Visitor<'de> for JSValueVisitor {
             type Value = JSValue;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -198,20 +198,20 @@ impl<'de> Deserialize<'de> for JSValue {
                 Ok(JSValue::String(value))
             }
 
-            fn visit_none<E>(self) -> Result<Self::Value, E> {
-                Ok(JSValue::Null)
-            }
-
-            fn visit_unit<E>(self) -> Result<Self::Value, E> {
-                Ok(JSValue::Undefined)
-            }
-
             fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E> {
                 Ok(JSValue::Bytes(value.to_vec()))
             }
 
             fn visit_byte_buf<E>(self, value: Vec<u8>) -> Result<Self::Value, E> {
                 Ok(JSValue::Bytes(value))
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(JSValue::Null)
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(JSValue::Undefined)
             }
 
             fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
@@ -267,7 +267,7 @@ impl<'de> Deserialize<'de> for JSValue {
                         }
                         BIGINT_TYPE => {
                             if let Some(entry) = object.get(BIGINT_VALUE_KEY) {
-                                match entry {
+                                return match entry {
                                     JSValue::String(value) => {
                                         let parsed = BigInt::parse_bytes(value.as_bytes(), 10)
                                             .ok_or_else(|| {
@@ -276,18 +276,14 @@ impl<'de> Deserialize<'de> for JSValue {
                                                     value
                                                 ))
                                             })?;
-                                        return Ok(JSValue::BigInt(parsed));
+                                        Ok(JSValue::BigInt(parsed))
                                     }
-                                    JSValue::Int(i) => {
-                                        return Ok(JSValue::BigInt(BigInt::from(*i)));
-                                    }
-                                    other => {
-                                        return Err(de::Error::custom(format!(
-                                            "Invalid BigInt payload: expected string, got {:?}",
-                                            other
-                                        )));
-                                    }
-                                }
+                                    JSValue::Int(i) => Ok(JSValue::BigInt(BigInt::from(*i))),
+                                    other => Err(de::Error::custom(format!(
+                                        "Invalid BigInt payload: expected string, got {:?}",
+                                        other
+                                    ))),
+                                };
                             }
                         }
                         JS_STREAM_TYPE => {

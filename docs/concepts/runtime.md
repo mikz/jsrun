@@ -86,7 +86,7 @@ You can customize runtime behavior via [`RuntimeConfig`][jsrun.RuntimeConfig]:
 from jsrun import Runtime, RuntimeConfig
 
 config = RuntimeConfig(
-    max_heap_size=1 * 1024 * 1024,  # Limit memory to 1MB
+    max_heap_size=10 * 1024 * 1024,  # Limit heap to 10MB
     bootstrap="const VERSION = '1.0.0';"  # Run code at startup
 )
 
@@ -94,6 +94,8 @@ with Runtime(config) as runtime:
     result = runtime.eval("VERSION")
     print(result)  # 1.0.0
 ```
+
+Exceeding the heap limit raises `RuntimeError` with "Heap limit exceeded".
 
 ## Running JavaScript Code
 

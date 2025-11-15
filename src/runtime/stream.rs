@@ -22,14 +22,23 @@ const STREAM_CHUNK_TYPE: &str = "StreamChunk";
 const STREAM_CHUNK_DONE_KEY: &str = "done";
 const STREAM_CHUNK_VALUE_KEY: &str = "value";
 
-/// Snapshot of streaming usage/health for exposure via runtime stats.
+/// Snapshot of streaming usage and health for runtime statistics.
+///
+/// Tracks active and total stream counts, plus bytes transferred in both directions
+/// (JS→Python and Python→JS).
 #[derive(Debug, Default, Clone)]
 pub struct StreamStatsSnapshot {
+    /// Number of currently active JavaScript streams.
     pub active_js_streams: u64,
+    /// Number of currently active Python streams.
     pub active_py_streams: u64,
+    /// Total JavaScript streams created over the runtime's lifetime.
     pub total_js_streams: u64,
+    /// Total Python streams created over the runtime's lifetime.
     pub total_py_streams: u64,
+    /// Bytes transferred from JavaScript to Python.
     pub bytes_streamed_js_to_py: u64,
+    /// Bytes transferred from Python to JavaScript.
     pub bytes_streamed_py_to_js: u64,
 }
 
@@ -53,9 +62,14 @@ impl StreamStatsSnapshot {
 }
 
 /// Host-side representation of a chunk pulled from a JS or Python stream.
+///
+/// Mirrors the structure returned by `ReadableStreamDefaultReader.read()`,
+/// with a `done` flag and optional `value`.
 #[derive(Debug, Clone)]
 pub struct StreamChunk {
+    /// True if the stream has ended (no more chunks available).
     pub done: bool,
+    /// Optional chunk value (None if done=true or stream was canceled).
     pub value: Option<JSValue>,
 }
 
@@ -159,10 +173,16 @@ impl JsStreamEntry {
 }
 
 /// Registry tracking live JS ReadableStream handles.
+///
+/// Manages V8 global handles for JavaScript `ReadableStream` objects and their readers,
+/// enabling Python code to consume chunks from JavaScript streams.
 #[derive(Default)]
 pub struct JsStreamRegistry {
+    /// Active stream entries indexed by stream ID.
     entries: RefCell<HashMap<u32, JsStreamEntry>>,
+    /// Next available stream ID.
     next_id: Cell<u32>,
+    /// Usage statistics for active/total streams and bytes transferred.
     stats: RefCell<JsStreamStats>,
 }
 
@@ -267,14 +287,24 @@ impl JsStreamRegistry {
 }
 
 /// Async iterator registry for Python-provided streams consumed inside JavaScript.
+///
+/// Manages Python async iterables that are exposed as JavaScript `ReadableStream`s.
+/// Thread-safe and clone-able for sharing across the handle and runtime thread.
 #[derive(Clone)]
 pub struct PyStreamRegistry {
+    /// Active stream entries indexed by stream ID.
     entries: Arc<Mutex<HashMap<u32, Arc<PyStreamEntry>>>>,
+    /// Next available stream ID.
     next_id: Arc<AtomicU32>,
+    /// Number of currently active streams.
     active: Arc<AtomicU64>,
+    /// Total streams created over the registry's lifetime.
     total: Arc<AtomicU64>,
+    /// Bytes transferred from Python to JavaScript.
     bytes: Arc<AtomicU64>,
+    /// Callbacks invoked when a stream is released.
     release_listeners: PyStreamReleaseListeners,
+    /// Serialization limits for chunk values.
     serialization_limits: SerializationLimits,
 }
 

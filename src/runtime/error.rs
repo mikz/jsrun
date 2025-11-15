@@ -92,7 +92,7 @@ pub enum RuntimeError {
     JavaScript(JsExceptionDetails),
     Timeout { context: String },
     Internal { context: String },
-    Terminated,
+    Terminated { reason: Option<String> },
 }
 
 impl RuntimeError {
@@ -113,7 +113,13 @@ impl RuntimeError {
     }
 
     pub fn terminated() -> Self {
-        Self::Terminated
+        Self::Terminated { reason: None }
+    }
+
+    pub fn terminated_with(reason: impl Into<String>) -> Self {
+        Self::Terminated {
+            reason: Some(reason.into()),
+        }
     }
 
     /// Access the stored context message for non-JavaScript errors.
@@ -121,7 +127,7 @@ impl RuntimeError {
         match self {
             Self::JavaScript(_) => None,
             Self::Timeout { context } | Self::Internal { context } => Some(context.as_str()),
-            Self::Terminated => Some("Runtime terminated"),
+            Self::Terminated { reason } => reason.as_deref().or(Some("Runtime terminated")),
         }
     }
 }
@@ -131,7 +137,9 @@ impl fmt::Display for RuntimeError {
         match self {
             Self::JavaScript(details) => write!(f, "{}", details.summary()),
             Self::Timeout { context } | Self::Internal { context } => f.write_str(context),
-            Self::Terminated => f.write_str("Runtime terminated"),
+            Self::Terminated { reason } => {
+                f.write_str(reason.as_deref().unwrap_or("Runtime terminated"))
+            }
         }
     }
 }
