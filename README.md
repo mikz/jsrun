@@ -1,15 +1,15 @@
 <div align="center">
   <a href="https://github.com/imfing/jsrun">
     <picture>
-      <img alt="jsrun" width="160" src="docs/assets/logo.svg"  >
+      <img alt="jsrun" width="100" src="docs/assets/logo.svg"  >
     </picture>
   </a>
 
 # jsrun
 
-**Modern V8 JavaScript runtime for Python**
+**Modern JavaScript runtime in Python**
 
-Seamlessly run JS next to Python with secure isolation, powered by V8 and bridged with Rust
+Seamlessly run JavaScript next to Python with secure isolation, powered by V8 and bridged with Rust
 
 <br />
 
@@ -87,12 +87,17 @@ with Runtime(config) as runtime:
 
 `jsrun` is designed for modern Python applications that need embedded JavaScript:
 
-- **AI agents** – execute LLM generated JavaScript in isolated sandboxes with memory/time limits
-- **Workflow runners** – let users upload JavaScript automations backed by your Python host
-- **Serverless / plugin runtimes** – spin up per-request V8 isolates with custom APIs
-- **Data playgrounds** – build notebooks or playgrounds that mix Python data and JS visualizations
+- **[AI agents](https://imfing.github.io/jsrun/use-cases/agents/)** – execute LLM generated JavaScript in isolated sandboxes with memory/time limits
+- **[Workflow runners](https://imfing.github.io/jsrun/use-cases/workflows/)** – let users upload JavaScript automations backed by your Python host
+- **[Serverless / plugin runtimes](https://imfing.github.io/jsrun/use-cases/serverless/)** – spin up per-request V8 isolates with custom APIs
+- **[Data playgrounds](https://imfing.github.io/jsrun/use-cases/playground/)** – build notebooks or playgrounds that mix Python data and JS visualizations
+- **[JavaScript libraries](https://github.com/imfing/jsrun/blob/main/examples/markdown_parser.py)** – use JavaScript packages like [marked.js][marked-js] directly in Python without Node.js
 
 ### Example: Code execution sandbox for AI Agent
+
+One of the most compelling use cases for `jsrun` is building safe execution environments for AI agents. When LLMs generate code, you need a way to run it securely with strict resource limits and isolation.
+
+This example shows how to create a [Pydantic AI](https://ai.pydantic.dev/) agent that can execute JavaScript code in a sandboxed V8 runtime with heap limits and timeouts:
 
 ```python
 import asyncio
@@ -165,3 +170,4 @@ Explore more in [Use Cases](https://imfing.github.io/jsrun/use-cases/playground/
 [pyo3]: https://pyo3.rs/
 [jsrun-pypi]: https://pypi.org/project/jsrun/
 [workflows-ci]: https://github.com/imfing/jsrun/actions/workflows/CI.yml
+[marked-js]: https://github.com/markedjs/marked
