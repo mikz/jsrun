@@ -209,7 +209,7 @@ impl Default for RuntimeConfig {
             initial_heap_size: None,
             execution_timeout: None,
             bootstrap_script: None,
-            enable_console: Some(true),
+            enable_console: Some(false),
             inspector: None,
             snapshot: None,
             max_serialization_depth: MAX_JS_DEPTH,
@@ -282,7 +282,7 @@ impl RuntimeConfig {
         initial_heap_size = None,
         bootstrap = None,
         timeout = None,
-        enable_console = Some(true),
+        enable_console = Some(false),
         inspector = None,
         snapshot = None,
         max_serialization_depth = None,
@@ -507,7 +507,7 @@ mod tests {
         assert!(config.initial_heap_size.is_none());
         assert!(config.execution_timeout.is_none());
         assert!(config.bootstrap_script.is_none());
-        assert_eq!(config.enable_console, Some(true));
+        assert_eq!(config.enable_console, Some(false));
         assert!(config.inspector.is_none());
         assert!(config.snapshot.is_none());
         assert_eq!(config.max_serialization_depth, MAX_JS_DEPTH);

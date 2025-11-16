@@ -37,12 +37,6 @@ graph TB
         P1 -.->|call via binding| API
         P2 -.->|call via binding| API
     end
-
-    style APP fill:#e1f5ff
-    style MGR fill:#e1f5ff
-    style API fill:#fff4e1
-    style P1 fill:#e1ffe1
-    style P2 fill:#e1ffe1
 ```
 
 ## Basic Implementation

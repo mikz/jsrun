@@ -15,7 +15,7 @@ impl Default for SnapshotBuilderConfig {
     fn default() -> Self {
         Self {
             bootstrap_script: None,
-            enable_console: Some(true),
+            enable_console: Some(false),
         }
     }
 }

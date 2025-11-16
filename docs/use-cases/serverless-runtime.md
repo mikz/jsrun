@@ -24,11 +24,6 @@ graph TB
 
     RT1 -.->|platform APIs| APIS[Database/Storage]
     RT2 -.->|platform APIs| APIS
-
-    style API fill:#e1f5ff
-    style POOL fill:#fff4e1
-    style RT1 fill:#e1ffe1
-    style RT2 fill:#e1ffe1
 ```
 
 ## Basic Implementation

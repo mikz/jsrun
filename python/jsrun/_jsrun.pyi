@@ -100,7 +100,7 @@ class RuntimeConfig:
         initial_heap_size: int | None = None,
         bootstrap: str | None = None,
         timeout: float | int | None = None,
-        enable_console: bool | None = True,
+        enable_console: bool | None = False,
         inspector: InspectorConfig | None = None,
         snapshot: bytes | None = None,
         max_serialization_depth: int | None = None,
@@ -114,7 +114,7 @@ class RuntimeConfig:
             initial_heap_size: Initial heap size in bytes
             bootstrap: JavaScript source code to execute on startup
             timeout: Execution timeout in seconds (float or int)
-            enable_console: Whether ``console`` APIs are exposed (defaults to True)
+            enable_console: Whether ``console`` APIs are exposed (defaults to False)
             inspector: Optional inspector configuration enabling Chrome DevTools
             snapshot: Optional V8 startup snapshot bytes
             max_serialization_depth: Maximum nesting depth when transferring values
@@ -918,7 +918,7 @@ class SnapshotBuilder:
         self,
         *,
         bootstrap: str | None = None,
-        enable_console: bool | None = True,
+        enable_console: bool | None = False,
     ) -> None:
         """
         Create a snapshot builder.
@@ -926,6 +926,7 @@ class SnapshotBuilder:
         Args:
             bootstrap: Optional JavaScript source run before any scripts added via ``execute_script``.
             enable_console: Whether ``console`` APIs remain available while preparing the snapshot.
+                Defaults to ``False`` (console is disabled by default).
         """
         ...
 

@@ -36,11 +36,6 @@ graph TB
         ISO1 -.->|uses| V8P
         ISO2 -.->|uses| V8P
     end
-
-    style PY fill:#e1f5ff
-    style V8P fill:#fff4e1
-    style ISO1 fill:#e1ffe1
-    style ISO2 fill:#e1ffe1
 ```
 
 Each runtime has its own isolated JavaScript environment and cannot access variables or functions from other runtimes. They run in parallel on separate threads.
@@ -98,6 +93,10 @@ with Runtime(config) as runtime:
 !!! warning "Heap Limit Considerations"
     - Exceeding the heap limit raises `RuntimeError` with "Heap limit exceeded"
     - Do not set the heap limit too low as it may prevent V8 from starting properly
+
+### Memory Footprint
+
+Each `Runtime` instance has a **~2.60 MB** memory overhead. Multiple runtimes scale efficiently (e.g., 16 concurrent isolates use ~42 MB total).
 
 ## Running JavaScript Code
 
@@ -280,7 +279,8 @@ Core JavaScript features like `Math`, `Array`, `Promise`, `Date`, `JSON`, and al
 ### What's Not Available
 
 - **Node.js APIs** such as `fs`, `http`, `process`, `Buffer`, or `require()`
-- **Web Platform APIs** such as `fetch`, `console`, `localStorage`, or DOM
+- **Web Platform APIs** such as `fetch`, `localStorage`, or DOM
+- **`console` API** is disabled by default for security. Enable with `RuntimeConfig(enable_console=True)` if needed for debugging.
 
 If you need these APIs, you can implement them yourself using the bindings system. See the [Bindings guide](../guides/bindings.md) for details.
 

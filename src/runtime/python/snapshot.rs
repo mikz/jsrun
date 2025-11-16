@@ -14,7 +14,7 @@ pub struct SnapshotBuilderPy {
 #[pymethods]
 impl SnapshotBuilderPy {
     #[new]
-    #[pyo3(signature = (bootstrap = None, enable_console = Some(true)))]
+    #[pyo3(signature = (bootstrap = None, enable_console = Some(false)))]
     fn new(bootstrap: Option<String>, enable_console: Option<bool>) -> PyResult<Self> {
         let config = SnapshotBuilderConfig {
             bootstrap_script: bootstrap,

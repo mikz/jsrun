@@ -2,6 +2,9 @@
 
 Snapshots let you pre-initialize JavaScript state and reuse it across multiple runtimes. Think of them as save points: you load libraries and set up globals once, then create fresh runtimes from that state instantly.
 
+!!! warning "Experimental Feature"
+    Snapshot support is currently limited and experimental. Some advanced features may not work as expected.
+
 ## Why Use Snapshots?
 
 Starting a runtime is fast, but loading libraries takes time. This becomes a bottleneck in cold-start scenarios where you create many short-lived runtimes:
@@ -50,12 +53,12 @@ graph TB
         R2 --> ST2["✓ <code>VERSION</code><br/>✓ <code>add()</code>"]
     end
 
-    style S fill:#fff4e1
-    style INIT fill:#ffe1e1
-    style R1 fill:#e1f5ff
-    style R2 fill:#e1f5ff
-    style ST1 fill:#e1ffe1
-    style ST2 fill:#e1ffe1
+    style S fill:#fff4e1,color:#000
+    style INIT fill:#ffe1e1,color:#000
+    style R1 fill:#e1f5ff,color:#000
+    style R2 fill:#e1f5ff,color:#000
+    style ST1 fill:#e1ffe1,color:#000
+    style ST2 fill:#e1ffe1,color:#000
 ```
 
 ## Creating Snapshots

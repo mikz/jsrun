@@ -40,13 +40,6 @@ graph TB
         STEP2 -.->|call| API
         STEP3 -.->|call| API
     end
-
-    style ENGINE fill:#e1f5ff
-    style SCHEDULER fill:#fff4e1
-    style API fill:#ffe1e1
-    style STEP1 fill:#e1ffe1
-    style STEP2 fill:#e1ffe1
-    style STEP3 fill:#e1ffe1
 ```
 
 ## Basic Implementation

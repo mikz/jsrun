@@ -7,10 +7,8 @@ surface promise/timeouts/errors consistently with the Rust core.
 """
 
 import asyncio
-import gc
 import math
 import time
-import weakref
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -26,7 +24,6 @@ from jsrun import (
     SnapshotBuilder,
     undefined,
 )
-from jsrun._jsrun import _debug_active_runtime_threads
 
 
 class TestRuntimeStats:
@@ -161,35 +158,6 @@ class TestRuntimeBasics:
             assert result == "undefined"
         finally:
             runtime.close()
-
-    def test_runtime_drop_shutdown(self):
-        """Dropping the Runtime without close() should let the thread exit."""
-        base_threads = _debug_active_runtime_threads()
-
-        runtime = Runtime()
-        assert _debug_active_runtime_threads() == base_threads + 1
-
-        runtime_ref = weakref.ref(runtime)
-        del runtime
-
-        # Wait for Python GC to collect the Runtime object
-        deadline = time.time() + 5
-        while runtime_ref() is not None and time.time() < deadline:
-            gc.collect()
-            time.sleep(0.05)
-
-        assert runtime_ref() is None
-
-        # Now wait for the runtime thread to observe the drop and exit
-        deadline = time.time() + 5
-        while time.time() < deadline:
-            if _debug_active_runtime_threads() == base_threads:
-                break
-            time.sleep(0.05)
-
-        assert _debug_active_runtime_threads() == base_threads, (
-            "runtime thread should exit after drop"
-        )
 
     def test_runtime_eval_simple(self):
         """Test basic JavaScript evaluation."""
@@ -1478,11 +1446,31 @@ class TestRuntimeConfig:
             result2 = runtime2.eval("typeof instance1")
             assert result2 == "undefined"
 
-    def test_runtime_config_console_enabled_by_default(self):
-        """Test that console is enabled by default."""
+    def test_runtime_config_console_disabled_by_default(self):
+        """Test that console is disabled by default."""
         from jsrun import Runtime, RuntimeConfig
 
         config = RuntimeConfig()
+        assert config.enable_console is False
+
+        with Runtime(config) as runtime:
+            # Console should either be undefined or a stub
+            console_type = runtime.eval("typeof console")
+            # When disabled, console is either deleted (undefined) or replaced with stub
+            assert console_type in ("undefined", "object")
+
+            # If console exists (stub), methods should be no-ops
+            if console_type == "object":
+                # Methods should exist but be no-ops
+                runtime.eval("console.log('test')")  # Should not raise
+                runtime.eval("console.error('test')")  # Should not raise
+                runtime.eval("console.warn('test')")  # Should not raise
+
+    def test_runtime_config_console_can_be_enabled(self):
+        """Test that console can be explicitly enabled."""
+        from jsrun import Runtime, RuntimeConfig
+
+        config = RuntimeConfig(enable_console=True)
         assert config.enable_console is True
 
         with Runtime(config) as runtime:

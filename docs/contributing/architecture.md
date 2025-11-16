@@ -41,14 +41,6 @@ graph TB
     DISPATCHER -->|owns| CORE
     CORE -->|contains| DENO
     DENO -->|wraps| V8
-
-    style PYRT_RS fill:#fff4e1
-    style HANDLE fill:#f0e1ff
-    style TOKIO fill:#ffe1f5
-    style DISPATCHER fill:#ffe1e1
-    style CORE fill:#fff4e1
-    style DENO fill:#e1f5ff
-    style V8 fill:#e1ffe1
 ```
 
 ### Layer 1: Python API

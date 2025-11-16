@@ -31,15 +31,9 @@ jsrun.bind_function("add", lambda a, b: a + b)
 print(jsrun.eval("add(2, 3)"))  # 5
 ```
 
-## Installation
-
-```bash
-pip install jsrun
-```
-
 ## Next Steps
 
-- Discover essential features in [Quick Start](quickstart.md)
+Discover essential features in [Quick Start](quickstart.md)
 
 [v8]: https://v8.dev/
 [promise]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Using_promises
