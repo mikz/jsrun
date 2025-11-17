@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import shutil
-import subprocess
 from pathlib import Path
 
 import bench_memory
@@ -18,26 +16,6 @@ ROOT = Path(__file__).resolve().parent
 def _print_title(title: str) -> None:
     print(f"\n{title}")
     print("-" * len(title))
-
-
-def _have_hyperfine() -> bool:
-    return shutil.which("hyperfine") is not None
-
-
-def _run_command(cmd: list[str]) -> None:
-    subprocess.run(cmd, cwd=ROOT, check=True)
-
-
-def _run_hyperfine(
-    commands: list[str],
-    warmup: int,
-    runs: int,
-    export_md: Path | None = None,
-) -> None:
-    args = ["hyperfine", "--warmup", str(warmup), "--runs", str(runs)]
-    if export_md is not None:
-        args += ["--export-markdown", str(export_md)]
-    _run_command(args + commands)
 
 
 def cmd_startup(iterations: int) -> None:

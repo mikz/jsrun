@@ -30,8 +30,8 @@ def bench_subprocess(iterations: int = 100) -> float:
 def main() -> None:
     iterations = 100
     print(f"Comparing {iterations} JavaScript evaluations:")
-    print(f"  • jsrun: create Runtime → eval → destroy")
-    print(f"  • Node.js: spawn process → eval → terminate")
+    print("  • jsrun: create Runtime → eval → destroy")
+    print("  • Node.js: spawn process → eval → terminate")
     print("-" * 60)
 
     # Warmup

@@ -2,6 +2,8 @@
 
 **Modern JavaScript runtime for Python**
 
+[![PyPI](https://img.shields.io/pypi/v/jsrun.svg)](https://pypi.org/project/jsrun/)
+
 jsrun is a Python library that embeds the [V8][v8] JavaScript engine, allowing you to run JavaScript code directly from Python.
 
 Whether you need to run user scripts, integrate JavaScript libraries, execute code for AI agents, or build extensible Python applications, `jsrun` provides a robust solution.
@@ -13,7 +15,7 @@ Whether you need to run user scripts, integrate JavaScript libraries, execute co
 - ⚡ **Async First**: Support JavaScript [Promises][promise] and [async function][async function] in Python [asyncio][asyncio]
 - 🔒 **Isolated Sandbox**: Runtime is a V8 isolate that has no I/O access by default
 - 🎛️ **Resource Controls**: Prevent abuse by setting per-runtime heap memory limits and execution timeouts
-- 🧵 **Thread-Safe**: Run multiple runtimes in parallel on different Python threads
+- 🧵 **Parallelism**: Run multiple runtimes in parallel on different Python threads
 - 📦 **Module Support**: ES modules with custom loaders and resolvers
 - ⚙️ **WebAssembly**: Execute WebAssembly (WASM) directly in native runtime
 - 🎯 **Typing**: Comprehensive type hints for PyO3 bindings
@@ -33,7 +35,11 @@ print(jsrun.eval("add(2, 3)"))  # 5
 
 ## Next Steps
 
-Discover essential features in [Quick Start](quickstart.md)
+- **[Quick Start](quickstart.md)** - Get up and running with essential features
+- **[Core Concepts](concepts/runtime.md)** - Understand the runtime architecture and execution model
+- **[Type Conversion](concepts/types.md)** - Learn how data types map between Python and JavaScript
+- **[Use Cases](use-cases/playground.md)** - Explore practical examples and real-world applications
+- **[API Reference](api/jsrun.md)** - Comprehensive API documentation for all classes and functions
 
 [v8]: https://v8.dev/
 [promise]: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Using_promises

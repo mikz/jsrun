@@ -13,7 +13,7 @@ Seamlessly run JavaScript next to Python with secure isolation, powered by V8 an
 
 <br />
 
-[![CI](https://github.com/imfing/jsrun/actions/workflows/CI.yml/badge.svg?branch=main)][workflows-ci]
+[![CI](https://github.com/imfing/jsrun/actions/workflows/CI.yml/badge.svg)][workflows-ci]
 [![PyPI](https://img.shields.io/pypi/v/jsrun.svg)][jsrun-pypi]
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
@@ -130,10 +130,8 @@ async def execute_javascript(ctx: RunContext, code: str) -> str:
     print(f"[Executing JavaScript code] '{code}'")
 
     try:
-        # Create a runtime with safety limits
-        config = RuntimeConfig(
-            max_heap_size=10 * 1024 * 1024,  # 10MB heap limit
-        )
+        # Create a runtime with 10MB heap limit
+        config = RuntimeConfig(max_heap_size=10 * 1024 * 1024)
 
         with Runtime(config) as runtime:
             result = await runtime.eval_async(code, timeout=5.0)
@@ -154,6 +152,27 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+```
+
+### Example: Using JavaScript libraries in Python
+
+You can load supported JavaScript libraries directly from CDNs and use them in Python without Node.js:
+
+```python
+import requests, jsrun
+
+response = requests.get("https://unpkg.com/lodash@4/lodash.min.js")
+jsrun.eval(response.text)
+
+# Use lodash functions
+result = jsrun.eval("_.chunk(['a', 'b', 'c', 'd'], 2)")
+print(result)  # [['a', 'b'], ['c', 'd']]
+
+# Bind Python data to JavaScript
+jsrun.bind_object("numbers", {"data": [1, 5, 10, 15, 20, 25]})
+
+result = jsrun.eval("_.filter(numbers.data, n => n >= 10)")
+print(result)  # [10, 15, 20, 25]
 ```
 
 Explore more in [Use Cases](https://imfing.github.io/jsrun/use-cases/playground/) and [Examples](https://github.com/imfing/jsrun/tree/main/examples)
