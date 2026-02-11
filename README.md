@@ -1,7 +1,7 @@
 <div align="center">
   <a href="https://github.com/imfing/jsrun">
     <picture>
-      <img alt="jsrun" width="100" src="docs/assets/logo.png"  >
+      <img alt="jsrun" src="docs/assets/banner.png" height="100" >
     </picture>
   </a>
 
@@ -46,7 +46,7 @@ print(jsrun.eval("add(2, 3)"))  # 5
 - **Fast V8 core** – the JavaScript engine used by Chrome and Node.js, bridged via Rust and PyO3
 - **Async-first APIs** – run async JavaScript without blocking Python code
 - **Extensible bindings** – expose Python functions/objects to JavaScript
-- **Secure defaults** – runtimes start with zero I/O, isolated V8 isolates per thread, and configurable heap/time limits
+- **Secure defaults** – runtimes start with zero I/O, separate V8 isolates per thread, and configurable heap/time limits
 - **Module & WASM support** – load ES modules with custom resolvers and execute WebAssembly directly
 
 ## Get Started
@@ -57,7 +57,7 @@ To get started, install it from PyPI (Python 3.10+ and macOS/Linux are required)
 pip install jsrun  # or uv pip install jsrun
 ```
 
-> **Note**: `jsrun` is under development. Expect breaking changes between minor versions.
+> **Note**: `jsrun` is experimental. Expect breaking changes between versions.
 
 Quick Example
 
@@ -75,7 +75,7 @@ print(jsrun.eval("add(3, 4)"))  # 7
 Need full control? Use the [`Runtime`](https://imfing.github.io/jsrun/api/runtime) class to configure heap/time limits, module loaders, and lifecycle management.
 
 ```python
-from jsrun import Runtime
+from jsrun import Runtime, RuntimeConfig
 
 config = RuntimeConfig(max_heap_size=10 * 1024 * 1024)  # 10MB limit
 
@@ -87,9 +87,9 @@ with Runtime(config) as runtime:
 
 `jsrun` is designed for modern Python applications that need embedded JavaScript:
 
-- **[AI agents](https://imfing.github.io/jsrun/use-cases/agents/)** – execute LLM generated JavaScript in isolated sandboxes with memory/time limits
-- **[Workflow runners](https://imfing.github.io/jsrun/use-cases/workflows/)** – let users upload JavaScript automations backed by your Python host
-- **[Serverless / plugin runtimes](https://imfing.github.io/jsrun/use-cases/serverless/)** – spin up per-request V8 isolates with custom APIs
+- **[AI agents](https://imfing.github.io/jsrun/use-cases/ai-agent/)** – execute LLM-generated JavaScript in isolated sandboxes with memory/time limits
+- **[Workflow runners](https://imfing.github.io/jsrun/use-cases/workflow/)** – let users upload JavaScript automations backed by your Python host
+- **[Serverless / plugin runtimes](https://imfing.github.io/jsrun/use-cases/serverless-runtime/)** – spin up per-request V8 isolates with custom APIs
 - **[Data playgrounds](https://imfing.github.io/jsrun/use-cases/playground/)** – build notebooks or playgrounds that mix Python data and JS visualizations
 - **[JavaScript libraries](https://github.com/imfing/jsrun/blob/main/examples/markdown_parser.py)** – use JavaScript packages like [marked.js][marked-js] directly in Python without Node.js
 
