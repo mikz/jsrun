@@ -194,7 +194,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ['3.10', '3.11', '3.12', '3.13', '3.14']
+        python-version: ['3.10', '3.11', '3.12', '3.13', '3.14', '3.14t']
       fail-fast: false
     steps:
       - uses: actions/checkout@v5
@@ -206,13 +206,46 @@ jobs:
         with:
           name: wheels-linux-manylinux
           path: dist
-      - name: Install and test wheel
+      - name: Install wheel and dependencies
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
-          WHEEL=$(ls dist/*cp$(echo ${{ matrix.python-version }} | tr -d '.')*x86_64.whl | head -n 1)
+
+          PYVER="${{ matrix.python-version }}"
+          if [[ "$PYVER" == *t ]]; then
+            base="${PYVER%t}"
+            nodot="${base//./}"
+            tag="cp${nodot}t-cp${nodot}t"
+          else
+            nodot="${PYVER//./}"
+            tag="cp${nodot}-cp${nodot}"
+          fi
+
+          shopt -s nullglob
+          WHEELS=(dist/*-"$tag"-*x86_64.whl)
+          if [[ ${#WHEELS[@]} -eq 0 ]]; then
+            echo "No wheel matched tag '$tag' for python '${PYVER}'."
+            echo "Available wheels:"
+            ls -lh dist/
+            exit 1
+          fi
+          if [[ ${#WHEELS[@]} -gt 1 ]]; then
+            echo "Multiple wheels matched tag '$tag'; selecting the first:"
+            printf '%s\n' "${WHEELS[@]}"
+          fi
+
+          WHEEL="${WHEELS[0]}"
           echo "Installing wheel: $WHEEL"
           pip install "$WHEEL"
           pip install pytest pytest-asyncio
+
+      - name: Free-threaded import check (GIL stays off)
+        if: endsWith(matrix.python-version, 't')
+        run: |
+          PYTHON_GIL=0 python -W error::RuntimeWarning -m pytest tests/test_freethreading_import.py -v
+
+      - name: Run test suite
+        run: |
           pytest tests/ -v
 
   test-wheels-aarch64:
