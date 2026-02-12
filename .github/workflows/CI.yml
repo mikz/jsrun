@@ -38,25 +38,36 @@ jobs:
           name: wheels-macos-${{ matrix.platform.target }}
           path: dist
 
-  test-macos-314t:
+  macos-314t:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
         with:
           python-version: '3.14t'
-      - uses: astral-sh/setup-uv@v7
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install deps + build extension
+      - name: Build wheel (cp314t)
+        uses: PyO3/maturin-action@v1
+        with:
+          target: aarch64
+          args: --release --out dist --interpreter python
+          sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
+      - name: Install wheel + test deps
         run: |
-          uv sync --frozen --group testing
-          uv run maturin develop --uv
+          python -m pip install --upgrade pip
+          python -m pip install --no-index --find-links dist jsrun
+          python -m pip install pytest pytest-asyncio
       - name: Free-threaded import check (GIL stays off)
         run: |
-          PYTHON_GIL=0 uv run python -W error::RuntimeWarning -m pytest tests/test_freethreading_import.py -v
+          PYTHON_GIL=0 python -W error::RuntimeWarning -m pytest tests/test_freethreading_import.py -v
       - name: Run test suite (GIL disabled)
         run: |
-          PYTHON_GIL=0 uv run python -m pytest tests/ -q
+          PYTHON_GIL=0 python -m pytest tests/ -q
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-macos-aarch64-314t
+          path: dist
 
   sdist:
     runs-on: ubuntu-latest
@@ -238,7 +249,13 @@ jobs:
         run: |
           PYTHON_GIL=0 python -W error::RuntimeWarning -m pytest tests/test_freethreading_import.py -v
 
+      - name: Run test suite (GIL disabled)
+        if: endsWith(matrix.python-version, 't')
+        run: |
+          PYTHON_GIL=0 python -m pytest tests/ -q
+
       - name: Run test suite
+        if: ${{ !endsWith(matrix.python-version, 't') }}
         run: |
           pytest tests/ -v
 
@@ -334,7 +351,7 @@ jobs:
 
   # Create GitHub Release with all artifacts
   release:
-    needs: [macos, test-macos-314t, sdist, build-wheels-manylinux, test-wheels-x86_64, test-wheels-aarch64, test-wheels-aarch64-314t]
+    needs: [macos, macos-314t, sdist, build-wheels-manylinux, test-wheels-x86_64, test-wheels-aarch64, test-wheels-aarch64-314t]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     steps:
