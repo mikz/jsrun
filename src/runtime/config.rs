@@ -36,7 +36,7 @@ fn parse_socket_addr(host: &str, port: u16) -> PyResult<SocketAddr> {
 /// Configures the WebSocket server that enables debugging via Chrome DevTools
 /// or compatible debuggers. The inspector runs on a separate thread from the
 /// runtime thread.
-#[pyclass(module = "jsrun")]
+#[pyclass(module = "jsrun", from_py_object)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InspectorConfig {
     /// Socket address (IP and port) for the inspector server.
@@ -170,7 +170,7 @@ impl InspectorConfig {
 ///
 /// Defines heap limits, optional bootstrap code, inspector settings, and
 /// serialization constraints for a V8 runtime instance.
-#[pyclass(module = "jsrun")]
+#[pyclass(module = "jsrun", from_py_object)]
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // Exposed to Python bindings; some fields are not wired yet in Rust.
 pub struct RuntimeConfig {

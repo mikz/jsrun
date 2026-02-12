@@ -107,7 +107,6 @@ impl RuntimeStats {
 }
 
 #[pyclass(module = "jsrun")]
-#[derive(Clone)]
 pub struct InspectorEndpoints {
     #[pyo3(get)]
     id: String,
