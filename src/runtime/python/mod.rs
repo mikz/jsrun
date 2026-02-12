@@ -3,7 +3,7 @@ use crate::runtime::runner;
 use pyo3::create_exception;
 use pyo3::exceptions::{PyException, PyRuntimeError};
 use pyo3::prelude::*;
-use std::sync::OnceLock;
+use pyo3::sync::PyOnceLock;
 
 /// Async bridge helpers shared across the bindings.
 mod bridge;
@@ -59,15 +59,10 @@ impl JsUndefined {
     }
 }
 
-static JS_UNDEFINED_SINGLETON: OnceLock<Py<JsUndefined>> = OnceLock::new();
+static JS_UNDEFINED_SINGLETON: PyOnceLock<Py<JsUndefined>> = PyOnceLock::new();
 
 pub(crate) fn get_js_undefined(py: Python<'_>) -> PyResult<Py<JsUndefined>> {
-    if let Some(existing) = JS_UNDEFINED_SINGLETON.get() {
-        Ok(existing.clone_ref(py))
-    } else {
-        let value = Py::new(py, JsUndefined)?;
-        let stored = value.clone_ref(py);
-        let _ = JS_UNDEFINED_SINGLETON.set(stored);
-        Ok(value)
-    }
+    JS_UNDEFINED_SINGLETON
+        .get_or_try_init(py, || Py::new(py, JsUndefined))
+        .map(|value| value.clone_ref(py))
 }
