@@ -12,6 +12,7 @@ use crate::runtime::stats::RuntimeStatsSnapshot;
 use crate::runtime::stream::{PyStreamRegistry, StreamChunk};
 use pyo3::prelude::Py;
 use pyo3::PyAny;
+use pyo3::Python;
 use pyo3_async_runtimes::{tokio as pyo3_tokio, TaskLocals};
 use std::collections::HashSet;
 use std::sync::mpsc;
@@ -207,6 +208,32 @@ impl RuntimeHandle {
             .map_err(|_| RuntimeError::internal("Failed to receive op registration result"))?
     }
 
+    pub fn register_op_py_attached(
+        &self,
+        py: Python<'_>,
+        name: String,
+        mode: PythonOpMode,
+        handler: Py<PyAny>,
+    ) -> RuntimeResult<u32> {
+        let sender = self.sender()?.clone();
+        let (result_tx, result_rx) = mpsc::channel();
+
+        sender
+            .send(RuntimeCommand::RegisterPythonOp {
+                name,
+                mode,
+                handler,
+                responder: result_tx,
+            })
+            .map_err(|_| RuntimeError::internal("Failed to send register_op command"))?;
+
+        py.detach(|| {
+            result_rx
+                .recv()
+                .map_err(|_| RuntimeError::internal("Failed to receive op registration result"))?
+        })
+    }
+
     /// Set a custom Python resolver for module specifier resolution.
     ///
     /// The resolver receives `(specifier, referrer)` and returns a resolved URL or None.
@@ -229,6 +256,30 @@ impl RuntimeHandle {
             .map_err(|_| RuntimeError::internal("Failed to receive set_module_resolver result"))?
     }
 
+    pub fn set_module_resolver_py_attached(
+        &self,
+        py: Python<'_>,
+        handler: Py<PyAny>,
+    ) -> RuntimeResult<()> {
+        let sender = self.sender()?.clone();
+        let (result_tx, result_rx) = mpsc::channel();
+
+        sender
+            .send(RuntimeCommand::SetModuleResolver {
+                handler,
+                responder: result_tx,
+            })
+            .map_err(|_| RuntimeError::internal("Failed to send set_module_resolver command"))?;
+
+        py.detach(|| {
+            result_rx
+                .recv()
+                .map_err(|_| RuntimeError::internal(
+                    "Failed to receive set_module_resolver result",
+                ))?
+        })
+    }
+
     /// Set a custom Python loader for fetching module source code.
     ///
     /// The loader receives a resolved specifier and returns the module source.
@@ -249,6 +300,28 @@ impl RuntimeHandle {
         result_rx
             .recv()
             .map_err(|_| RuntimeError::internal("Failed to receive set_module_loader result"))?
+    }
+
+    pub fn set_module_loader_py_attached(
+        &self,
+        py: Python<'_>,
+        handler: Py<PyAny>,
+    ) -> RuntimeResult<()> {
+        let sender = self.sender()?.clone();
+        let (result_tx, result_rx) = mpsc::channel();
+
+        sender
+            .send(RuntimeCommand::SetModuleLoader {
+                handler,
+                responder: result_tx,
+            })
+            .map_err(|_| RuntimeError::internal("Failed to send set_module_loader command"))?;
+
+        py.detach(|| {
+            result_rx
+                .recv()
+                .map_err(|_| RuntimeError::internal("Failed to receive set_module_loader result"))?
+        })
     }
 
     /// Register a static ES module with pre-defined source code.

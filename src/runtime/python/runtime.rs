@@ -166,49 +166,49 @@ impl Runtime {
             .unwrap_or(0))
     }
 
-    fn close(&self) -> PyResult<()> {
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
         let mut handle = self.handle.borrow_mut();
         if let Some(mut runtime) = handle.take() {
-            for stream_id in runtime.drain_tracked_js_stream_ids() {
-                if runtime.is_shutdown() {
-                    break;
+            py.detach(|| {
+                for stream_id in runtime.drain_tracked_js_stream_ids() {
+                    if runtime.is_shutdown() {
+                        break;
+                    }
+                    if let Err(err) = runtime.stream_release(stream_id) {
+                        log::debug!(
+                            "Runtime.close failed to release stream id {}: {}",
+                            stream_id,
+                            err
+                        );
+                    }
                 }
-                if let Err(err) = runtime.stream_release(stream_id) {
-                    log::debug!(
-                        "Runtime.close failed to release stream id {}: {}",
-                        stream_id,
-                        err
-                    );
+                for stream_id in runtime.drain_tracked_py_stream_ids() {
+                    runtime.cancel_py_stream_async(stream_id);
                 }
-            }
-            for stream_id in runtime.drain_tracked_py_stream_ids() {
-                runtime.cancel_py_stream_async(stream_id);
-            }
-            for fn_id in runtime.drain_tracked_function_ids() {
-                if runtime.is_shutdown() {
-                    break;
+                for fn_id in runtime.drain_tracked_function_ids() {
+                    if runtime.is_shutdown() {
+                        break;
+                    }
+                    if let Err(err) = runtime.release_function(fn_id) {
+                        log::debug!(
+                            "Runtime.close failed to release function id {}: {}",
+                            fn_id,
+                            err
+                        );
+                    }
                 }
-                if let Err(err) = runtime.release_function(fn_id) {
-                    log::debug!(
-                        "Runtime.close failed to release function id {}: {}",
-                        fn_id,
-                        err
-                    );
-                }
-            }
-            runtime
-                .close()
-                .map_err(|e| runtime_error_with_context("Shutdown failed", e))?;
+                runtime.close()
+            })
+            .map_err(|e| runtime_error_with_context("Shutdown failed", e))?;
         }
         Ok(())
     }
 
-    fn terminate(&self) -> PyResult<()> {
+    fn terminate(&self, py: Python<'_>) -> PyResult<()> {
         let handle = self.handle.borrow().as_ref().cloned();
 
         if let Some(handle) = handle {
-            handle
-                .terminate()
+            py.detach(|| handle.terminate())
                 .map_err(|e| runtime_error_with_context("Termination failed", e))
         } else {
             Ok(())
@@ -234,7 +234,7 @@ impl Runtime {
         let mode_enum = Self::checked_mode(py, mode, &handler_clone)?;
 
         handle
-            .register_op(name, mode_enum, handler_clone)
+            .register_op_py_attached(py, name, mode_enum, handler_clone)
             .map_err(|e| runtime_error_with_context("Op registration failed", e))
     }
 
@@ -256,7 +256,7 @@ impl Runtime {
         };
 
         let op_id = handle
-            .register_op(name.clone(), mode_enum, handler_clone)
+            .register_op_py_attached(py, name.clone(), mode_enum, handler_clone)
             .map_err(|e| runtime_error_with_context("Op registration failed", e))?;
 
         let bridge_name = match mode_enum {
@@ -321,7 +321,7 @@ impl Runtime {
                 };
                 let op_name = format!("{name}.{key_str}");
                 let op_id = handle
-                    .register_op(op_name, mode_enum, handler_py)
+                    .register_op_py_attached(py, op_name, mode_enum, handler_py)
                     .map_err(|e| runtime_error_with_context("Op registration failed", e))?;
                 bindings.push(BoundObjectProperty::Op {
                     key: key_str,
@@ -337,13 +337,12 @@ impl Runtime {
             }
         }
 
-        handle
-            .bind_object(name, bindings)
+        py.detach(|| handle.bind_object(name, bindings))
             .map_err(|e| runtime_error_with_context("Failed to bind object", e))?;
         Ok(())
     }
 
-    fn set_module_resolver(&self, _py: Python<'_>, resolver: Py<PyAny>) -> PyResult<()> {
+    fn set_module_resolver(&self, py: Python<'_>, resolver: Py<PyAny>) -> PyResult<()> {
         let handle = self
             .handle
             .borrow()
@@ -352,12 +351,12 @@ impl Runtime {
             .clone();
 
         handle
-            .set_module_resolver(resolver)
+            .set_module_resolver_py_attached(py, resolver)
             .map_err(|e| runtime_error_with_context("Failed to set module resolver", e))?;
         Ok(())
     }
 
-    fn set_module_loader(&self, _py: Python<'_>, loader: Py<PyAny>) -> PyResult<()> {
+    fn set_module_loader(&self, py: Python<'_>, loader: Py<PyAny>) -> PyResult<()> {
         let handle = self
             .handle
             .borrow()
@@ -366,12 +365,12 @@ impl Runtime {
             .clone();
 
         handle
-            .set_module_loader(loader)
+            .set_module_loader_py_attached(py, loader)
             .map_err(|e| runtime_error_with_context("Failed to set module loader", e))?;
         Ok(())
     }
 
-    fn add_static_module(&self, _py: Python<'_>, name: String, source: String) -> PyResult<()> {
+    fn add_static_module(&self, py: Python<'_>, name: String, source: String) -> PyResult<()> {
         let handle = self
             .handle
             .borrow()
@@ -379,8 +378,7 @@ impl Runtime {
             .ok_or_else(|| PyRuntimeError::new_err("Runtime has been closed"))?
             .clone();
 
-        handle
-            .add_static_module(name, source)
+        py.detach(|| handle.add_static_module(name, source))
             .map_err(|e| runtime_error_with_context("Failed to add static module", e))?;
         Ok(())
     }
@@ -567,8 +565,8 @@ impl JsFunction {
         let js_args = self.convert_python_args(args)?;
         let timeout_ms = normalize_timeout_to_ms(timeout)?;
 
-        let call_result = handle
-            .call_function_sync(fn_id, js_args, timeout_ms)
+        let call_result = py
+            .detach(|| handle.call_function_sync(fn_id, js_args, timeout_ms))
             .map_err(|e| runtime_error_with_context("Function call failed", e))?;
 
         match call_result {
@@ -697,7 +695,7 @@ impl JsFunctionFinalizer {
 
 #[pymethods]
 impl JsFunctionFinalizer {
-    fn __call__(&self) {
+    fn __call__(&self, py: Python<'_>) {
         let mut handle = self.handle.lock().unwrap();
         if let Some(runtime_handle) = handle.take() {
             if !runtime_handle.is_function_tracked(self.fn_id) {
@@ -707,7 +705,8 @@ impl JsFunctionFinalizer {
                 runtime_handle.untrack_function_id(self.fn_id);
                 return;
             }
-            if let Err(err) = runtime_handle.release_function(self.fn_id) {
+            let result = py.detach(|| runtime_handle.release_function(self.fn_id));
+            if let Err(err) = result {
                 log::debug!(
                     "JsFunction finalizer failed to release function id {}: {}",
                     self.fn_id,
