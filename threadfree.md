@@ -23,17 +23,19 @@ _Last reviewed: 2026-02-12_
 
 ## Current repo state (facts)
 - Rust:
-  - `pyo3 = 0.27.0` (`Cargo.toml`).
+  - `pyo3 = 0.28.0` (`Cargo.toml`).
   - The extension module is `jsrun._jsrun`; Rust module init is `#[pymodule] fn _jsrun(...)` in `src/lib.rs`.
   - `_jsrun` sets `gil_used = false` in `src/lib.rs` (PR 1).
   - Global Python-object singleton: `src/runtime/python/mod.rs` uses `PyOnceLock<Py<JsUndefined>>`.
-  - Some sync calls already use `py.detach(...)` (e.g. `Runtime.eval`), but other sync paths block without detaching (notably `JsFunction.__call__`, plus various `RuntimeHandle` command/recv methods).
+  - Blocking sync calls detach where appropriate (e.g. `Runtime.eval`, `JsFunction.__call__`, `Runtime.close` / `terminate`, sync op registration).
 - Python:
-  - `python/jsrun/__init__.py` stores the default runtime in a `ContextVar` as `_RuntimeSlot(runtime, owner)` where owner is the current asyncio Task (if any) else the current Thread.
-  - This design can interact badly with context propagation (notably threads inheriting context) because `Runtime` is `unsendable`.
+  - `python/jsrun/__init__.py` stores the default runtime per-thread (`threading.local()`) or per-asyncio-task (task attribute), not in a `ContextVar`.
+  - pytest treats `PytestUnraisableExceptionWarning` containing `unsendable` as an error (`pyproject.toml`).
 - CI:
   - Linux x86_64 wheel tests include `python-version: 3.14t` and run `tests/test_freethreading_import.py` under `PYTHON_GIL=0`.
   - Wheel installation in CI uses `pip install --no-index --find-links dist jsrun` so pip selects the correct wheel tag (`cp314-cp314` vs `cp314-cp314t`).
+  - macOS has a dedicated `3.14t` test job.
+  - Linux aarch64 has a dedicated `3.14t` test job using `/opt/python/cp314-cp314t/bin/python` in a manylinux container.
 
 ---
 
@@ -60,14 +62,7 @@ Blocking while attached can deadlock; detach before blocking/waiting on mutexes,
 ---
 
 ## Gaps + risks (repo-specific)
-- Gap A: Default runtime storage uses `ContextVar` holding a `Runtime` instance.
-  - Context propagation can cause a `Runtime` to be dropped on a different thread, producing unraisable exceptions like:
-    - `Runtime is unsendable, but is being dropped on another thread`
-- Gap C: Blocking sync operations run while attached:
-  - `JsFunction.__call__` blocks on `call_function_sync` without `py.detach`
-  - other `RuntimeHandle` blocking calls (close/terminate/register_op/etc) need a detach audit
-- Gap D: CI does not yet run `3.14t` tests on macOS arm64 or Linux aarch64.
-- Gap E: PyO3 should be upgraded (target: `pyo3 = 0.28.0`) and revalidated on `3.14t`.
+None identified that block free-threaded `3.14t` support.
 
 ---
 
