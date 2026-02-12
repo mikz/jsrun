@@ -210,34 +210,8 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-
-          PYVER="${{ matrix.python-version }}"
-          if [[ "$PYVER" == *t ]]; then
-            base="${PYVER%t}"
-            nodot="${base//./}"
-            tag="cp${nodot}t-cp${nodot}t"
-          else
-            nodot="${PYVER//./}"
-            tag="cp${nodot}-cp${nodot}"
-          fi
-
-          shopt -s nullglob
-          WHEELS=(dist/*-"$tag"-*x86_64.whl)
-          if [[ ${#WHEELS[@]} -eq 0 ]]; then
-            echo "No wheel matched tag '$tag' for python '${PYVER}'."
-            echo "Available wheels:"
-            ls -lh dist/
-            exit 1
-          fi
-          if [[ ${#WHEELS[@]} -gt 1 ]]; then
-            echo "Multiple wheels matched tag '$tag'; selecting the first:"
-            printf '%s\n' "${WHEELS[@]}"
-          fi
-
-          WHEEL="${WHEELS[0]}"
-          echo "Installing wheel: $WHEEL"
-          pip install "$WHEEL"
-          pip install pytest pytest-asyncio
+          python -m pip install --no-index --find-links dist jsrun || { echo "Available wheels:"; ls -lh dist/; exit 1; }
+          python -m pip install pytest pytest-asyncio
 
       - name: Free-threaded import check (GIL stays off)
         if: endsWith(matrix.python-version, 't')
@@ -268,15 +242,13 @@ jobs:
           path: dist
       - name: Test wheel in aarch64 container
         run: |
-          WHEEL=$(ls dist/*cp$(echo ${{ matrix.python-version }} | tr -d '.')*aarch64.whl | head -n 1)
-          echo "Testing wheel: $WHEEL"
           docker run --rm --platform linux/arm64 \
             -v "$(pwd):/work" \
             -w /work \
             python:${{ matrix.python-version }}-slim \
             bash -c "
               pip install --upgrade pip && \
-              pip install $WHEEL && \
+              pip install --no-index --find-links /work/dist jsrun && \
               pip install pytest pytest-asyncio && \
               pytest tests/ -v
             "
