@@ -25,8 +25,8 @@ _Last reviewed: 2026-02-12_
 - Rust:
   - `pyo3 = 0.27.0` (`Cargo.toml`).
   - The extension module is `jsrun._jsrun`; Rust module init is `#[pymodule] fn _jsrun(...)` in `src/lib.rs`.
-  - `_jsrun` currently does **not** set `gil_used = false`.
-  - Global Python-object singleton: `src/runtime/python/mod.rs` uses `OnceLock<Py<JsUndefined>>`.
+  - `_jsrun` sets `gil_used = false` in `src/lib.rs` (PR 1).
+  - Global Python-object singleton: `src/runtime/python/mod.rs` uses `PyOnceLock<Py<JsUndefined>>`.
   - Some sync calls already use `py.detach(...)` (e.g. `Runtime.eval`), but other sync paths block without detaching (notably `JsFunction.__call__`, plus various `RuntimeHandle` command/recv methods).
 - Python:
   - `python/jsrun/__init__.py` stores a ContextVar `_RuntimeSlot(runtime, owner)` where owner is the current asyncio Task (if any) else the current Thread.
@@ -57,8 +57,6 @@ Blocking while attached can deadlock; detach before blocking/waiting on mutexes,
 ---
 
 ## Gaps + risks (repo-specific)
-- Gap A: `_jsrun` module not marked `gil_used = false` → import enables GIL.
-- Gap B: Global singleton uses `OnceLock<Py<...>>` → replace with `PyOnceLock` or use `OnceLockExt::get_or_init_py_attached`.
 - Gap C: Blocking sync operations run while attached:
   - `JsFunction.__call__` blocks on `call_function_sync` without `py.detach`
   - other `RuntimeHandle` blocking calls (close/terminate/register_op/etc) need a detach audit
