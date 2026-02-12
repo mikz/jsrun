@@ -1,7 +1,6 @@
 """Tests for the module-level API jsrun (module-level convenience functions)."""
 
 import asyncio
-import contextvars
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -145,39 +144,15 @@ class TestContextIsolation:
         assert results == ["task-a", "task-b"]
 
     @pytest.mark.asyncio
-    async def test_async_task_isolation(self):
-        """Test that different contexts get separate runtimes."""
-        # Note: asyncio tasks in the same event loop share ContextVar context
-        # To get true isolation, we need to run in separate contexts
-        results = []
+    async def test_async_task_cleanup(self):
+        """Default runtimes created in tasks should not leak across tasks."""
 
-        def task1():
-            ctx = contextvars.copy_context()
+        async def worker(tag: str) -> str:
+            await jsrun.eval_async(f"globalThis.tag = '{tag}'")
+            return await jsrun.eval_async("globalThis.tag")
 
-            def run():
-                jsrun.eval("globalThis.taskId = 'task1'")
-                result = jsrun.eval("globalThis.taskId")
-                results.append(("task1", result))
-
-            ctx.run(run)
-
-        def task2():
-            ctx = contextvars.copy_context()
-
-            def run():
-                jsrun.eval("globalThis.taskId = 'task2'")
-                result = jsrun.eval("globalThis.taskId")
-                results.append(("task2", result))
-
-            ctx.run(run)
-
-        # Run in separate contexts
-        task1()
-        task2()
-
-        # Each context should see its own value
-        assert ("task1", "task1") in results
-        assert ("task2", "task2") in results
+        results = await asyncio.gather(worker("task1"), worker("task2"))
+        assert results == ["task1", "task2"]
 
     def test_thread_isolation(self):
         """Test that different threads get separate runtimes."""
@@ -199,24 +174,26 @@ class TestContextIsolation:
         for thread_id, result in results:
             assert thread_id == result
 
-    def test_context_var_isolation(self):
-        """Test that contextvars properly isolate runtimes."""
+    def test_threadpool_context_propagation_does_not_share_runtime(self):
+        """Context propagation into a worker thread must not share the default runtime."""
+        jsrun.eval("globalThis.mainValue = 123")
+        assert jsrun.eval("globalThis.mainValue") == 123
 
-        def isolated_context(value):
-            ctx = contextvars.copy_context()
-            result = ctx.run(
-                lambda: (
-                    jsrun.eval(f"globalThis.value = {value}"),
-                    jsrun.eval("globalThis.value"),
-                )
-            )
-            return result[1]
+        def worker() -> tuple[str, str]:
+            # If the default runtime leaked across threads, this would be "number".
+            main_seen = jsrun.eval("typeof globalThis.mainValue")
+            jsrun.eval("globalThis.workerValue = 456")
+            worker_seen = jsrun.eval("typeof globalThis.workerValue")
+            jsrun.close_default_runtime()
+            return main_seen, worker_seen
 
-        result1 = isolated_context(100)
-        result2 = isolated_context(200)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            main_seen, worker_seen = executor.submit(worker).result()
 
-        assert result1 == 100
-        assert result2 == 200
+        assert main_seen == "undefined"
+        assert worker_seen == "number"
+        assert jsrun.eval("typeof globalThis.workerValue") == "undefined"
+        jsrun.close_default_runtime()
 
 
 class TestRuntimeRecreation:

@@ -1,6 +1,5 @@
 """High-level Python bindings for the jsrun runtime."""
 
-import contextvars
 import asyncio
 import atexit
 import threading
@@ -65,7 +64,6 @@ def _runtime_bind(
 @dataclass(slots=True)
 class _RuntimeSlot:
     runtime: Runtime
-    owner: object
     closed: bool = False
 
     def close(self) -> None:
@@ -76,28 +74,43 @@ class _RuntimeSlot:
             self.runtime.close()
 
 
-def _current_runtime_owner() -> object:
+def _current_asyncio_task() -> asyncio.Task[Any] | None:
     try:
         task = asyncio.current_task()
     except RuntimeError:
         task = None
-    if task is not None:
-        return task
-    return threading.current_thread()
+    return task
 
 
-def _schedule_owner_cleanup(slot: _RuntimeSlot) -> None:
-    owner = slot.owner
-    if isinstance(owner, asyncio.Task):
-        owner.add_done_callback(lambda _: slot.close())
+_TASK_SLOT_ATTR = "__jsrun_default_runtime_slot__"
+_thread_local = threading.local()
+
+
+def _get_task_slot(task: asyncio.Task[Any]) -> _RuntimeSlot | None:
+    return getattr(task, _TASK_SLOT_ATTR, None)
+
+
+def _set_task_slot(task: asyncio.Task[Any], slot: _RuntimeSlot | None) -> None:
+    if slot is None:
+        if hasattr(task, _TASK_SLOT_ATTR):
+            delattr(task, _TASK_SLOT_ATTR)
+        return
+    setattr(task, _TASK_SLOT_ATTR, slot)
+
+
+def _get_thread_slot() -> _RuntimeSlot | None:
+    return getattr(_thread_local, "slot", None)
+
+
+def _set_thread_slot(slot: _RuntimeSlot | None) -> None:
+    if slot is None:
+        if hasattr(_thread_local, "slot"):
+            delattr(_thread_local, "slot")
+        return
+    _thread_local.slot = slot
 
 
 setattr(Runtime, "bind", _runtime_bind)
-
-
-_default_runtime_var: contextvars.ContextVar[_RuntimeSlot | None] = (
-    contextvars.ContextVar("jsrun_default_runtime", default=None)
-)
 
 
 def get_default_runtime() -> Runtime:
@@ -112,25 +125,38 @@ def get_default_runtime() -> Runtime:
     Returns:
         Runtime: The context-local runtime instance.
     """
-    slot = _default_runtime_var.get()
-    owner = _current_runtime_owner()
-    if slot is None or slot.runtime.is_closed() or slot.owner is not owner:
-        slot = _RuntimeSlot(runtime=Runtime(), owner=owner)
-        _default_runtime_var.set(slot)
-        _schedule_owner_cleanup(slot)
+    task = _current_asyncio_task()
+    if task is not None:
+        slot = _get_task_slot(task)
+        if slot is None or slot.runtime.is_closed():
+            slot = _RuntimeSlot(runtime=Runtime())
+            _set_task_slot(task, slot)
+            task.add_done_callback(lambda _: slot.close())
+        return slot.runtime
+
+    slot = _get_thread_slot()
+    if slot is None or slot.runtime.is_closed():
+        slot = _RuntimeSlot(runtime=Runtime())
+        _set_thread_slot(slot)
     return slot.runtime
 
 
 def close_default_runtime() -> None:
     """Close the current context's runtime, if one exists."""
-    slot = _default_runtime_var.get()
+    task = _current_asyncio_task()
+    if task is not None:
+        slot = _get_task_slot(task)
+        if slot is None:
+            return
+        slot.close()
+        _set_task_slot(task, None)
+        return
+
+    slot = _get_thread_slot()
     if slot is None:
         return
-    owner = _current_runtime_owner()
-    if slot.owner is not owner:
-        raise RuntimeError("Default runtime can only be closed from its owner context.")
     slot.close()
-    _default_runtime_var.set(None)
+    _set_thread_slot(None)
 
 
 def _close_default_runtime_on_exit() -> None:
