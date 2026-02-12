@@ -227,7 +227,7 @@ impl RuntimeHandle {
             })
             .map_err(|_| RuntimeError::internal("Failed to send register_op command"))?;
 
-        py.detach(|| {
+        py.detach(move || {
             result_rx
                 .recv()
                 .map_err(|_| RuntimeError::internal("Failed to receive op registration result"))?
@@ -271,7 +271,7 @@ impl RuntimeHandle {
             })
             .map_err(|_| RuntimeError::internal("Failed to send set_module_resolver command"))?;
 
-        py.detach(|| {
+        py.detach(move || {
             result_rx
                 .recv()
                 .map_err(|_| RuntimeError::internal(
@@ -317,7 +317,7 @@ impl RuntimeHandle {
             })
             .map_err(|_| RuntimeError::internal("Failed to send set_module_loader command"))?;
 
-        py.detach(|| {
+        py.detach(move || {
             result_rx
                 .recv()
                 .map_err(|_| RuntimeError::internal("Failed to receive set_module_loader result"))?
