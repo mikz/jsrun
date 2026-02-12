@@ -29,8 +29,11 @@ _Last reviewed: 2026-02-12_
   - Global Python-object singleton: `src/runtime/python/mod.rs` uses `PyOnceLock<Py<JsUndefined>>`.
   - Some sync calls already use `py.detach(...)` (e.g. `Runtime.eval`), but other sync paths block without detaching (notably `JsFunction.__call__`, plus various `RuntimeHandle` command/recv methods).
 - Python:
-  - `python/jsrun/__init__.py` stores a ContextVar `_RuntimeSlot(runtime, owner)` where owner is the current asyncio Task (if any) else the current Thread.
-  - This already causes the default runtime to be recreated when used from a different thread/task; keep this, but add a free-threaded regression test because free-threaded builds inherit contextvars into new threads by default.
+  - `python/jsrun/__init__.py` stores the default runtime in a `ContextVar` as `_RuntimeSlot(runtime, owner)` where owner is the current asyncio Task (if any) else the current Thread.
+  - This design can interact badly with context propagation (notably threads inheriting context) because `Runtime` is `unsendable`.
+- CI:
+  - Linux x86_64 wheel tests include `python-version: 3.14t` and run `tests/test_freethreading_import.py` under `PYTHON_GIL=0`.
+  - Wheel installation in CI uses `pip install --no-index --find-links dist jsrun` so pip selects the correct wheel tag (`cp314-cp314` vs `cp314-cp314t`).
 
 ---
 
@@ -57,45 +60,25 @@ Blocking while attached can deadlock; detach before blocking/waiting on mutexes,
 ---
 
 ## Gaps + risks (repo-specific)
+- Gap A: Default runtime storage uses `ContextVar` holding a `Runtime` instance.
+  - Context propagation can cause a `Runtime` to be dropped on a different thread, producing unraisable exceptions like:
+    - `Runtime is unsendable, but is being dropped on another thread`
 - Gap C: Blocking sync operations run while attached:
   - `JsFunction.__call__` blocks on `call_function_sync` without `py.detach`
   - other `RuntimeHandle` blocking calls (close/terminate/register_op/etc) need a detach audit
-- Gap D: CI likely builds `cp314t` wheels already (manylinux images ship `cp314-cp314t` and the build uses `maturin build --find-interpreter`), but:
-  - no CI job runs under a free-threaded interpreter
-  - wheel-selection logic can pick a non-`t` wheel when testing “3.14”
+- Gap D: CI does not yet run `3.14t` tests on macOS arm64 or Linux aarch64.
+- Gap E: PyO3 should be upgraded (target: `pyo3 = 0.28.0`) and revalidated on `3.14t`.
 
 ---
 
 ## Roadmap (PR-sized)
-### PR 1: “GIL stays off” proof-of-life
-- Rust:
-  - `src/lib.rs`: change to `#[pymodule(gil_used = false)] fn _jsrun(...)`.
-- Tests:
-  - Add a free-threading-only import test:
-    - skip unless `sysconfig.get_config_var("Py_GIL_DISABLED") == 1`
-    - run with `PYTHON_GIL=0` and `-W error::RuntimeWarning`
-    - assert `sys._is_gil_enabled() is False` after `import jsrun`
-- CI:
-  - Add `python-version: '3.14t'` jobs (at least Linux x86_64 + macOS arm64).
-
-### PR 2: Single-init safety (PyOnceLock / OnceLockExt)
-- `src/runtime/python/mod.rs`:
-  - Replace `OnceLock<Py<JsUndefined>>` with `PyOnceLock<Py<JsUndefined>>`, or
-  - keep `OnceLock` but use `OnceLockExt::get_or_init_py_attached(py, ...)`.
-
-### PR 3: Detach around blocking sync calls
-- Add `py.detach(|| ...)` around blocking Rust operations that do not touch Python objects.
-- Minimum targets:
-  - `JsFunction.__call__`: detach around `handle.call_function_sync(...)`.
-  - `Runtime.close`, `Runtime.terminate`, `Runtime.register_op`, and other sync methods that wait on runtime-thread responses.
-
-### PR 4: CI + publishing guardrails
-- Ensure `cp314t` wheels are explicitly tested:
-  - Linux x86_64: when running `3.14t`, install a `*cp314t*` wheel (not `*cp314*`).
-  - Linux aarch64: do not use `python:3.14-slim` for `t` testing; run tests in a container that has a free-threaded interpreter (e.g. manylinux’s `/opt/python/cp314-cp314t/bin/python`).
-  - macOS arm64: run tests under `actions/setup-python@v6` with `python-version: 3.14t`.
-- Add a release gate:
-  - If artifacts contain any `*cp31*t*` wheel, require the free-threaded test jobs to pass before publishing.
+### PR 1: “GIL stays off” proof-of-life (done)
+### PR 2: Single-init safety (done)
+### PR 3: Default runtime storage fix (ContextVar → task/thread storage)
+### PR 4: Treat “unsendable” unraisables as pytest errors
+### PR 5: Detach audit for blocking sync calls (+ concurrency smoke)
+### PR 6: CI + publishing guardrails for `3.14t` (macOS arm64 + Linux aarch64)
+### PR 8: Upgrade PyO3 to 0.28.0 and revalidate
 
 ---
 
@@ -110,6 +93,25 @@ Blocking while attached can deadlock; detach before blocking/waiting on mutexes,
    - Child thread uses `jsrun.eval(...)` and gets its own runtime.
 
 ---
+
+## Validation commands (local)
+### Normal CPython (default project env)
+- `uv sync --frozen --group testing`
+- `uv run -m pytest -q`
+
+### Free-threaded CPython 3.14t (wheel-based)
+```sh
+uvx python@3.14t -VV
+
+TMPDIR=$(mktemp -d)
+uv venv --seed -p 3.14t "$TMPDIR/venv"
+"$TMPDIR/venv/bin/python" -m pip install -q pytest pytest-asyncio
+
+uvx maturin build --release --out "$TMPDIR/dist" --interpreter "$TMPDIR/venv/bin/python"
+"$TMPDIR/venv/bin/python" -m pip install -q --no-index --find-links "$TMPDIR/dist" --force-reinstall jsrun
+
+PYTHON_GIL=0 "$TMPDIR/venv/bin/python" -W error::RuntimeWarning -m pytest -q
+```
 
 ## References
 - PyO3: Supporting Free-Threaded Python
