@@ -33,8 +33,9 @@ _Last reviewed: 2026-02-12_
   - pytest treats `PytestUnraisableExceptionWarning` containing `unsendable` as an error (`pyproject.toml`).
 - CI:
   - Linux x86_64 wheel tests include `python-version: 3.14t` and run `tests/test_freethreading_import.py` under `PYTHON_GIL=0`.
+  - Linux x86_64 `3.14t` runs the full test suite with `PYTHON_GIL=0`.
   - Wheel installation in CI uses `pip install --no-index --find-links dist jsrun` so pip selects the correct wheel tag (`cp314-cp314` vs `cp314-cp314t`).
-  - macOS has a dedicated `3.14t` test job.
+  - macOS builds and tests a dedicated `cp314t` wheel (`macos-314t` job).
   - Linux aarch64 has a dedicated `3.14t` test job using `/opt/python/cp314-cp314t/bin/python` in a manylinux container.
 
 ---
@@ -86,6 +87,11 @@ None identified that block free-threaded `3.14t` support.
    - Parent thread initializes default runtime.
    - Child thread starts (inherits contextvars by default on free-threaded builds).
    - Child thread uses `jsrun.eval(...)` and gets its own runtime.
+
+Concrete coverage in this repo:
+- `tests/test_freethreading_import.py` (import does not enable GIL)
+- `tests/test_freethreading_concurrency_smoke.py` (threadpool eval + bind_function + eval_async concurrency)
+- `tests/test_jsrun_api.py` includes `test_threadpool_context_propagation_does_not_share_runtime`
 
 ---
 
