@@ -70,6 +70,7 @@ runs:
         CIBW_BUILD: ${{ inputs.build }}
         CIBW_BUILD_VERBOSITY: "1"
         CIBW_MANYLINUX_X86_64_IMAGE: "jsrun-manylinux-x86_64"
+        CIBW_BEFORE_BUILD_LINUX: "bash /project/tools/ci/ensure_v8_known_target_triples.sh"
         CIBW_OUTPUT_DIR: "wheelhouse"
         CIBW_ARCHS_LINUX: "x86_64"
 
@@ -80,6 +81,7 @@ runs:
         CIBW_BUILD: ${{ inputs.build }}
         CIBW_BUILD_VERBOSITY: "1"
         CIBW_MANYLINUX_AARCH64_IMAGE: "jsrun-manylinux-aarch64"
+        CIBW_BEFORE_BUILD_LINUX: "bash /project/tools/ci/ensure_v8_known_target_triples.sh"
         CIBW_OUTPUT_DIR: "wheelhouse"
         CIBW_ARCHS_LINUX: "aarch64"
 
