@@ -45,7 +45,7 @@ runs:
 
     - name: Build wheels
       if: ${{ inputs.platform == 'linux' }}
-      uses: pypa/cibuildwheel@v2.23.2
+      uses: pypa/cibuildwheel@v3.3.1
       env:
         CIBW_BUILD: ${{ inputs.build }}
         CIBW_BUILD_VERBOSITY: "1"
@@ -56,7 +56,7 @@ runs:
 
     - name: Build wheels
       if: ${{ inputs.platform == 'macos' }}
-      uses: pypa/cibuildwheel@v2.23.2
+      uses: pypa/cibuildwheel@v3.3.1
       env:
         CIBW_BUILD: ${{ inputs.build }}
         CIBW_BUILD_VERBOSITY: "1"
@@ -65,7 +65,7 @@ runs:
 
     - name: Build wheels
       if: ${{ inputs.platform == 'windows' }}
-      uses: pypa/cibuildwheel@v2.23.2
+      uses: pypa/cibuildwheel@v3.3.1
       env:
         CIBW_BUILD: ${{ inputs.build }}
         CIBW_BUILD_VERBOSITY: "1"
