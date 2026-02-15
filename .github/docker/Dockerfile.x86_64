@@ -24,6 +24,10 @@ RUN echo "deb https://apt.llvm.org/jammy/ llvm-toolchain-jammy-19 main" > /etc/a
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
+# cibuildwheel uses `build[uv]` so the `uv` binary must exist in the image.
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:${PATH}"
+
 # Prefer Clang 19 for host compilation and bindgen.
 ENV CC=clang-19
 ENV CXX=clang-19
@@ -59,4 +63,3 @@ RUN printf '%s\n' \
 WORKDIR /workdir
 
 CMD ["/bin/bash"]
-
