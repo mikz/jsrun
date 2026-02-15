@@ -62,8 +62,7 @@ filterwarnings = [
 [tool.cibuildwheel]
 build = "cp310-* cp311-* cp312-* cp313-* cp314-* cp314t-*"
 enable = ["cpython-freethreading"]
-build-frontend = "build"
-build-frontend-args = ["--installer", "uv"]
+build-frontend = "build[uv]"
 test-requires = ["pytest", "pytest-asyncio"]
 test-command = "pytest -q {project}/tests"
 manylinux-x86_64-image = "manylinux_2_28"
