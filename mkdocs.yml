@@ -1,10 +1,10 @@
 site_name: jsrun
 site_description: JavaScript runtime for Python powered by V8 and Rust
 site_author: imfing
-site_url: https://imfing.github.io/jsrun
+site_url: https://mikz.github.io/jsrun
 
-repo_name: imfing/jsrun
-repo_url: https://github.com/imfing/jsrun
+repo_name: mikz/jsrun
+repo_url: https://github.com/mikz/jsrun
 edit_uri: edit/main/docs/
 
 theme:

@@ -1,0 +1,147 @@
+name: Publish GitHub Release assets
+description: Create/update a GitHub Release and upload wheel/sdist artifacts.
+
+inputs:
+  tag:
+    description: "Release tag (e.g. nightly or v0.1.0)"
+    required: true
+  prerelease:
+    description: "true|false"
+    required: true
+  nightly_build_tag:
+    description: "true|false; if true, add build tag to wheel filenames and clear old nightly assets"
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/checkout@v5
+      with:
+        fetch-depth: 0
+
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: artifacts
+        merge-multiple: true
+
+    - name: Prepare dist/
+      shell: bash
+      run: |
+        set -euo pipefail
+        rm -rf dist
+        mkdir -p dist
+        find artifacts -type f \( -name '*.whl' -o -name '*.tar.gz' \) -print -exec cp {} dist/ \;
+        ls -lh dist/
+
+    - name: Nightly: add wheel build tag
+      if: ${{ inputs.nightly_build_tag == 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        python - <<'PY'
+        import os, re
+        from pathlib import Path
+        run_number = os.environ["GITHUB_RUN_NUMBER"]
+        dist = Path("dist")
+        for whl in dist.glob("*.whl"):
+            # PEP 427: {dist}-{version}(-{build tag})?-{python tag}-{abi tag}-{platform tag}.whl
+            m = re.match(
+                r"^(?P<namever>.+?)-(?P<py>[^-]+)-(?P<abi>[^-]+)-(?P<plat>[^-]+)\.whl$",
+                whl.name,
+            )
+            if not m:
+                raise SystemExit(f"Unexpected wheel filename: {whl.name}")
+            namever = m.group("namever")
+            py = m.group("py")
+            abi = m.group("abi")
+            plat = m.group("plat")
+            new = dist / f"{namever}-{run_number}-{py}-{abi}-{plat}.whl"
+            whl.rename(new)
+        PY
+        ls -lh dist/
+
+    - name: Generate SHA256SUMS.txt
+      shell: bash
+      run: |
+        set -euo pipefail
+        python - <<'PY'
+        import hashlib
+        from pathlib import Path
+        dist = Path("dist")
+        lines = []
+        for path in sorted(dist.iterdir()):
+            if not path.is_file() or path.name == "SHA256SUMS.txt":
+                continue
+            h = hashlib.sha256()
+            with path.open("rb") as f:
+                for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                    h.update(chunk)
+            lines.append(f"{h.hexdigest()}  {path.name}")
+        (dist / "SHA256SUMS.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        print("\n".join(lines[:20]))
+        PY
+
+    - name: Configure gh auth
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        gh auth status
+
+    - name: Nightly: force-move tag
+      if: ${{ inputs.tag == 'nightly' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git tag -f nightly "$GITHUB_SHA"
+        git push -f origin nightly
+
+    - name: Create/update release
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        TAG="${{ inputs.tag }}"
+        TITLE="${TAG}"
+        PRERELEASE="${{ inputs.prerelease }}"
+
+        if gh release view "$TAG" >/dev/null 2>&1; then
+          if [ "$PRERELEASE" = "true" ]; then
+            gh release edit "$TAG" --title "$TITLE" --prerelease
+          else
+            gh release edit "$TAG" --title "$TITLE"
+          fi
+        else
+          if [ "$PRERELEASE" = "true" ]; then
+            gh release create "$TAG" --prerelease --title "$TITLE" --notes "Automated nightly build."
+          else
+            gh release create "$TAG" --title "$TITLE" --generate-notes
+          fi
+        fi
+
+    - name: Nightly: delete old assets
+      if: ${{ inputs.nightly_build_tag == 'true' }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        TAG="${{ inputs.tag }}"
+        gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" --jq '.assets[]? | .id' | while read -r id; do
+          [ -n "$id" ] || continue
+          gh api -X DELETE "repos/${GITHUB_REPOSITORY}/releases/assets/${id}" >/dev/null
+        done
+
+    - name: Upload assets
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        TAG="${{ inputs.tag }}"
+        gh release upload "$TAG" dist/* --clobber

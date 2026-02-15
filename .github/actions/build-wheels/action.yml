@@ -1,0 +1,67 @@
+name: Build wheels (cibuildwheel)
+description: Build and test wheels for a single OS/arch combination using cibuildwheel.
+
+inputs:
+  platform:
+    description: "linux|macos|windows"
+    required: true
+  arch:
+    description: "x86_64|aarch64|arm64|AMD64"
+    required: true
+  artifact_name:
+    description: "Artifact name to upload wheels under"
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/checkout@v5
+
+    - uses: actions/setup-python@v6
+      with:
+        python-version: "3.12"
+
+    - uses: dtolnay/rust-toolchain@stable
+
+    - uses: astral-sh/setup-uv@v7
+
+    - name: Set up QEMU (linux aarch64)
+      if: ${{ inputs.platform == 'linux' && inputs.arch == 'aarch64' }}
+      uses: docker/setup-qemu-action@v3
+      with:
+        platforms: arm64
+
+    - name: Build wheels
+      if: ${{ inputs.platform == 'linux' }}
+      uses: pypa/cibuildwheel@v2.23.2
+      env:
+        CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-* cp314-* cp314t-*"
+        CIBW_BUILD_VERBOSITY: "1"
+        CIBW_MANYLINUX_X86_64_IMAGE: "manylinux_2_28"
+        CIBW_MANYLINUX_AARCH64_IMAGE: "manylinux_2_28"
+        CIBW_OUTPUT_DIR: "wheelhouse"
+        CIBW_ARCHS_LINUX: ${{ inputs.arch }}
+
+    - name: Build wheels
+      if: ${{ inputs.platform == 'macos' }}
+      uses: pypa/cibuildwheel@v2.23.2
+      env:
+        CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-* cp314-* cp314t-*"
+        CIBW_BUILD_VERBOSITY: "1"
+        CIBW_OUTPUT_DIR: "wheelhouse"
+        CIBW_ARCHS_MACOS: ${{ inputs.arch }}
+
+    - name: Build wheels
+      if: ${{ inputs.platform == 'windows' }}
+      uses: pypa/cibuildwheel@v2.23.2
+      env:
+        CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-* cp314-* cp314t-*"
+        CIBW_BUILD_VERBOSITY: "1"
+        CIBW_OUTPUT_DIR: "wheelhouse"
+        CIBW_ARCHS_WINDOWS: ${{ inputs.arch }}
+
+    - name: Upload wheels
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.artifact_name }}
+        path: wheelhouse/*

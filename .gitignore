@@ -16,6 +16,7 @@ bin/
 build/
 develop-eggs/
 dist/
+dist-ft/
 eggs/
 lib/
 lib64/
@@ -61,6 +62,9 @@ coverage.xml
 
 # Sphinx documentation
 docs/_build/
+
+# MkDocs output
+site/
 
 # PyCharm
 .idea/
