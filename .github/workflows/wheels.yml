@@ -32,7 +32,7 @@ jobs:
             allow_fail: false
           - platform: macos
             arch: x86_64
-            runner: macos-13
+            runner: macos-14
             allow_fail: false
           - platform: macos
             arch: arm64
