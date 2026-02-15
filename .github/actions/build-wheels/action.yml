@@ -23,6 +23,16 @@ runs:
 
     - uses: astral-sh/setup-uv@v7
 
+    - name: Install Rust target (macos x86_64)
+      if: ${{ inputs.platform == 'macos' && inputs.arch == 'x86_64' }}
+      shell: bash
+      run: rustup target add x86_64-apple-darwin
+
+    - name: Install Rust target (macos arm64)
+      if: ${{ inputs.platform == 'macos' && inputs.arch == 'arm64' }}
+      shell: bash
+      run: rustup target add aarch64-apple-darwin
+
     - name: Set up QEMU (linux aarch64)
       if: ${{ inputs.platform == 'linux' && inputs.arch == 'aarch64' }}
       uses: docker/setup-qemu-action@v3
