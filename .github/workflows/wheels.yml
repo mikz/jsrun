@@ -48,6 +48,7 @@ jobs:
         with:
           platform: ${{ matrix.platform }}
           arch: ${{ matrix.arch }}
+          build: ${{ startsWith(github.ref, 'refs/tags/v') && 'cp310-* cp311-* cp312-* cp313-* cp314-* cp314t-*' || 'cp314-* cp314t-*' }}
           artifact_name: wheelhouse-${{ matrix.platform }}-${{ matrix.arch }}
 
   build-sdist:

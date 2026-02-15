@@ -8,6 +8,10 @@ inputs:
   arch:
     description: "x86_64|aarch64|arm64|AMD64"
     required: true
+  build:
+    description: "cibuildwheel build selector (e.g. cp314-* cp314t-*)"
+    required: false
+    default: "cp310-* cp311-* cp312-* cp313-* cp314-* cp314t-*"
   artifact_name:
     description: "Artifact name to upload wheels under"
     required: true
@@ -43,7 +47,7 @@ runs:
       if: ${{ inputs.platform == 'linux' }}
       uses: pypa/cibuildwheel@v2.23.2
       env:
-        CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-* cp314-* cp314t-*"
+        CIBW_BUILD: ${{ inputs.build }}
         CIBW_BUILD_VERBOSITY: "1"
         CIBW_MANYLINUX_X86_64_IMAGE: "manylinux_2_28"
         CIBW_MANYLINUX_AARCH64_IMAGE: "manylinux_2_28"
@@ -54,7 +58,7 @@ runs:
       if: ${{ inputs.platform == 'macos' }}
       uses: pypa/cibuildwheel@v2.23.2
       env:
-        CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-* cp314-* cp314t-*"
+        CIBW_BUILD: ${{ inputs.build }}
         CIBW_BUILD_VERBOSITY: "1"
         CIBW_OUTPUT_DIR: "wheelhouse"
         CIBW_ARCHS_MACOS: ${{ inputs.arch }}
@@ -63,7 +67,7 @@ runs:
       if: ${{ inputs.platform == 'windows' }}
       uses: pypa/cibuildwheel@v2.23.2
       env:
-        CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-* cp314-* cp314t-*"
+        CIBW_BUILD: ${{ inputs.build }}
         CIBW_BUILD_VERBOSITY: "1"
         CIBW_OUTPUT_DIR: "wheelhouse"
         CIBW_ARCHS_WINDOWS: ${{ inputs.arch }}
