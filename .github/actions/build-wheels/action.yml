@@ -43,12 +43,34 @@ runs:
       with:
         platforms: arm64
 
+    - name: Set up Docker Buildx (linux)
+      if: ${{ inputs.platform == 'linux' }}
+      uses: docker/setup-buildx-action@v3
+
+    - name: Build manylinux image (linux x86_64)
+      if: ${{ inputs.platform == 'linux' && inputs.arch == 'x86_64' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        docker build -t jsrun-manylinux-x86_64 -f .github/docker/Dockerfile.x86_64 .
+        docker image ls jsrun-manylinux-x86_64
+
+    - name: Build manylinux image (linux aarch64)
+      if: ${{ inputs.platform == 'linux' && inputs.arch == 'aarch64' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        docker buildx build --load --platform linux/arm64 -t jsrun-manylinux-aarch64 -f .github/docker/Dockerfile.aarch64 .
+        docker image ls jsrun-manylinux-aarch64
+
     - name: Build wheels (linux x86_64)
       if: ${{ inputs.platform == 'linux' && inputs.arch == 'x86_64' }}
       uses: pypa/cibuildwheel@v3.3.1
       env:
         CIBW_BUILD: ${{ inputs.build }}
         CIBW_BUILD_VERBOSITY: "1"
+        CIBW_MANYLINUX_X86_64_IMAGE: "jsrun-manylinux-x86_64"
+        CIBW_BEFORE_BUILD_LINUX: "bash /project/tools/ci/patch_v8_git_for_manylinux.sh"
         CIBW_OUTPUT_DIR: "wheelhouse"
         CIBW_ARCHS_LINUX: "x86_64"
 
@@ -58,6 +80,8 @@ runs:
       env:
         CIBW_BUILD: ${{ inputs.build }}
         CIBW_BUILD_VERBOSITY: "1"
+        CIBW_MANYLINUX_AARCH64_IMAGE: "jsrun-manylinux-aarch64"
+        CIBW_BEFORE_BUILD_LINUX: "bash /project/tools/ci/patch_v8_git_for_manylinux.sh"
         CIBW_OUTPUT_DIR: "wheelhouse"
         CIBW_ARCHS_LINUX: "aarch64"
 

@@ -1,0 +1,62 @@
+# x86_64 manylinux builder for jsrun wheels.
+#
+# We must build `v8` from source on Linux to link it into a Python extension
+# module (`cdylib`) successfully (PIC is required for `-shared`).
+
+FROM ghcr.io/rust-cross/manylinux_2_28-cross:x86_64
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Toolchain pieces needed to build V8 + its Rust bindings.
+RUN echo "deb https://apt.llvm.org/jammy/ llvm-toolchain-jammy-19 main" > /etc/apt/sources.list.d/llvm-toolchain-jammy-19.list && \
+    curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor > /etc/apt/trusted.gpg.d/llvm-snapshot.gpg && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        clang-19 \
+        lld-19 \
+        libclang-19-dev \
+        libc++-19-dev \
+        libc++abi-19-dev \
+        ninja-build \
+        python3.11 \
+        git && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# Prefer Clang 19 for host compilation and bindgen.
+ENV CC=clang-19
+ENV CXX=clang-19
+ENV LIBCLANG_PATH=/usr/lib/llvm-19/lib
+ENV PATH=/usr/lib/llvm-19/bin:${PATH}
+
+# V8 build tooling uses `python` directly and expects SSL to work for any
+# downloads; use system Python rather than the manylinux /opt/python builds.
+ENV PYTHON=/usr/bin/python3.11
+
+# Bindgen needs to find both V8's custom libc++ and system headers.
+ENV BINDGEN_EXTRA_CLANG_ARGS_x86_64_unknown_linux_gnu="\
+-Ithird_party/libc++/src/include \
+-Ithird_party/libc++abi/src/include \
+-Ibuildtools/third_party/libc++ \
+-isystem/usr/include \
+-isystem/usr/include/x86_64-linux-gnu"
+
+# Force V8 to build from source so the resulting static library can be linked
+# into a shared object (Python extension module).
+ENV V8_FROM_SOURCE=1
+ENV GN_ARGS="use_custom_libcxx=true clang_use_chrome_plugins=false is_clang=true use_lld=true treat_warnings_as_errors=false use_glib=false v8_monolithic=true v8_monolithic_for_shared_library=true"
+
+# cibuildwheel expects this helper to exist in manylinux images.
+RUN printf '%s\n' \
+    '#!/bin/bash' \
+    '' \
+    'set -euo pipefail' \
+    '' \
+    '/opt/python/cp312-cp312/bin/python "/opt/_internal/build_scripts/manylinux-interpreters.py" "$@"' \
+    > /usr/local/bin/manylinux-interpreters && chmod +x /usr/local/bin/manylinux-interpreters
+
+WORKDIR /workdir
+
+CMD ["/bin/bash"]
+
