@@ -33,15 +33,18 @@ jobs:
         run: |
           set -euo pipefail
           BASE="https://mikz.github.io/jsrun"
-          for i in $(seq 1 30); do
-            if curl -fsSL "$BASE/" >/dev/null 2>&1; then
-              echo "Pages reachable."
+          INDEX_NIGHTLY="${BASE}/nightly/simple/"
+          INDEX_STABLE="${BASE}/simple/"
+
+          for i in $(seq 1 60); do
+            if curl -fsSL "${INDEX_NIGHTLY}" | grep -q 'href="jsrun/' ; then
+              echo "Pages reachable and PEP 503 root present."
               exit 0
             fi
-            echo "Pages not reachable yet ($i/30), waiting 10s..."
+            echo "Pages index not reachable yet ($i/60), waiting 10s..."
             sleep 10
           done
-          echo "ERROR: GitHub Pages not reachable at $BASE/. Ensure Pages is enabled and set to 'GitHub Actions' source."
+          echo "ERROR: GitHub Pages PEP 503 index not reachable at ${INDEX_NIGHTLY}. Ensure Pages is enabled and set to 'GitHub Actions' source."
           exit 1
 
       - name: Create venv
@@ -55,7 +58,15 @@ jobs:
         run: |
           set -euo pipefail
           INDEX="https://mikz.github.io/jsrun/nightly/simple/"
-          curl -fsSL "${INDEX}jsrun/" | head -n 50
+          for i in $(seq 1 60); do
+            if curl -fsSL "${INDEX}jsrun/" | grep -Eiq '\.(whl|tar\.gz)</a>' ; then
+              echo "Nightly package index populated."
+              break
+            fi
+            echo "Nightly package index not populated yet ($i/60), waiting 10s..."
+            sleep 10
+          done
+          curl -fsSL "${INDEX}jsrun/" | head -n 100
           uv pip install \
             --python .venv/bin/python \
             --default-index "$INDEX" \
@@ -78,7 +89,7 @@ jobs:
         run: |
           set -euo pipefail
           INDEX="https://mikz.github.io/jsrun/simple/"
-          if curl -fsSL "${INDEX}jsrun/" | grep -q ".whl"; then
+          if curl -fsSL "${INDEX}jsrun/" | grep -Eiq '\.(whl|tar\.gz)</a>' ; then
             uv pip install \
               --python .venv/bin/python \
               --default-index "$INDEX" \
