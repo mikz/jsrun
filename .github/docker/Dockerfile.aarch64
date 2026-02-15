@@ -58,6 +58,15 @@ RUN rustup target add aarch64-unknown-linux-gnu
 ENV V8_FROM_SOURCE=1
 ENV GN_ARGS="use_custom_libcxx=true v8_monolithic=true v8_monolithic_for_shared_library=true"
 
+# cibuildwheel expects this helper to exist in manylinux images.
+RUN printf '%s\n' \
+    '#!/bin/bash' \
+    '' \
+    'set -euo pipefail' \
+    '' \
+    '/opt/python/cp312-cp312/bin/python "/opt/_internal/build_scripts/manylinux-interpreters.py" "$@"' \
+    > /usr/local/bin/manylinux-interpreters && chmod +x /usr/local/bin/manylinux-interpreters
+
 WORKDIR /workdir
 
 CMD ["/bin/bash"]
