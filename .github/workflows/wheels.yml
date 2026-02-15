@@ -43,6 +43,7 @@ jobs:
             runner: windows-latest
             allow_fail: true
     steps:
+      - uses: actions/checkout@v5
       - uses: ./.github/actions/build-wheels
         with:
           platform: ${{ matrix.platform }}
@@ -69,6 +70,9 @@ jobs:
     needs: [build-wheels, build-sdist]
     if: github.ref == 'refs/heads/main'
     steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
       - uses: ./.github/actions/publish-release
         with:
           tag: nightly
@@ -80,6 +84,9 @@ jobs:
     needs: [build-wheels, build-sdist]
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
       - uses: ./.github/actions/publish-release
         with:
           tag: ${{ github.ref_name }}
