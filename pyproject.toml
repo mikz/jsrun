@@ -63,8 +63,10 @@ filterwarnings = [
 build = "cp310-* cp311-* cp312-* cp313-* cp314-* cp314t-*"
 enable = ["cpython-freethreading"]
 build-frontend = "build[uv]"
-test-requires = ["pytest", "pytest-asyncio"]
-test-command = "pytest -q {project}/tests"
+test-command = [
+  "python -c \"import subprocess, sys; subprocess.check_call(['uv', 'pip', 'install', '--python', sys.executable, 'pytest', 'pytest-asyncio'])\"",
+  "python -m pytest -q {project}/tests",
+]
 manylinux-x86_64-image = "manylinux_2_28"
 manylinux-aarch64-image = "manylinux_2_28"
 
@@ -72,6 +74,7 @@ manylinux-aarch64-image = "manylinux_2_28"
 select = "cp314t-*"
 environment = { PYTHON_GIL = "0" }
 test-command = [
+  "python -c \"import subprocess, sys; subprocess.check_call(['uv', 'pip', 'install', '--python', sys.executable, 'pytest', 'pytest-asyncio'])\"",
   "python -W error::RuntimeWarning -m pytest -q {project}/tests/test_freethreading_import.py",
   "python -m pytest -q {project}/tests",
 ]

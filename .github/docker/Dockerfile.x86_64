@@ -28,6 +28,11 @@ RUN echo "deb https://apt.llvm.org/jammy/ llvm-toolchain-jammy-19 main" > /etc/a
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 ENV PATH="/root/.local/bin:${PATH}"
 
+# Install Rust toolchain so maturin doesn't try to bootstrap rustup using the
+# manylinux /opt/python interpreters (which can be built without OpenSSL).
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+ENV PATH="/root/.cargo/bin:${PATH}"
+
 # Prefer Clang 19 for host compilation and bindgen.
 ENV CC=clang-19
 ENV CXX=clang-19
