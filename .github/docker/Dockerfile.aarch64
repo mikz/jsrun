@@ -7,6 +7,7 @@ RUN echo "deb https://apt.llvm.org/jammy/ llvm-toolchain-jammy-19 main" > /etc/a
     curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor > /etc/apt/trusted.gpg.d/llvm-snapshot.gpg && \
     apt-get update && \
     apt-get install -y --no-install-recommends \
+        ca-certificates \
         lld-19 \
         clang-19 \
         clang-tools-19 \
@@ -27,6 +28,10 @@ ENV CC=clang-19
 ENV CXX=clang-19
 ENV LIBCLANG_PATH=/usr/lib/llvm-19/lib
 ENV PATH=/usr/lib/llvm-19/bin:${PATH}
+
+# Force v8 build tooling to use the system Python (has SSL), rather than the
+# manylinux /opt/python interpreters (which can be built without SSL support).
+ENV PYTHON=/usr/bin/python3.11
 
 # Keep the aarch64 sysroot provided by the cross toolchain so V8 links
 # against glibc 2.28 rather than the host.

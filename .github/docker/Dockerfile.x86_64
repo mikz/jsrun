@@ -9,6 +9,7 @@ RUN echo "deb https://apt.llvm.org/jammy/ llvm-toolchain-jammy-19 main" > /etc/a
     curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor > /etc/apt/trusted.gpg.d/llvm-snapshot.gpg && \
     apt-get update && \
     apt-get install -y --no-install-recommends \
+        ca-certificates \
         lld-19 \
         clang-19 \
         clang-tools-19 \
@@ -29,6 +30,10 @@ ENV CC=clang-19
 ENV CXX=clang-19
 ENV LIBCLANG_PATH=/usr/lib/llvm-19/lib
 ENV PATH=/usr/lib/llvm-19/bin:${PATH}
+
+# Force v8 build tooling to use the system Python (has SSL), rather than the
+# manylinux /opt/python interpreters (which can be built without SSL support).
+ENV PYTHON=/usr/bin/python3.11
 
 # For x86_64 native build: configure bindgen to find both V8's custom libc++ and system headers
 # Relative paths (third_party/*) are resolved from V8 source during build
