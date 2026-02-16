@@ -61,6 +61,7 @@ filterwarnings = [
 
 [tool.cibuildwheel]
 build = "cp310-* cp311-* cp312-* cp313-* cp314-* cp314t-*"
+skip = "pp* *-musllinux_*"
 enable = ["cpython-freethreading"]
 build-frontend = "build[uv]"
 test-command = [

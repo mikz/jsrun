@@ -63,11 +63,28 @@ runs:
         docker buildx build --load --platform linux/arm64 -t jsrun-manylinux-aarch64 -f .github/docker/Dockerfile.aarch64 .
         docker image ls jsrun-manylinux-aarch64
 
+    - name: Validate Linux build identifiers (manylinux only)
+      if: ${{ inputs.platform == 'linux' }}
+      shell: bash
+      env:
+        CIBW_BUILD: ${{ inputs.build }}
+        CIBW_SKIP: "*-musllinux_*"
+        CIBW_ARCHS_LINUX: ${{ inputs.arch }}
+      run: |
+        set -euo pipefail
+        identifiers="$(uvx cibuildwheel --platform linux --print-build-identifiers)"
+        echo "${identifiers}"
+        if echo "${identifiers}" | grep -q "musllinux"; then
+          echo "ERROR: musllinux identifiers detected in Linux wheel build plan." >&2
+          exit 1
+        fi
+
     - name: Build wheels (linux x86_64)
       if: ${{ inputs.platform == 'linux' && inputs.arch == 'x86_64' }}
       uses: pypa/cibuildwheel@v3.3.1
       env:
         CIBW_BUILD: ${{ inputs.build }}
+        CIBW_SKIP: "*-musllinux_*"
         CIBW_BUILD_VERBOSITY: "1"
         CIBW_MANYLINUX_X86_64_IMAGE: "jsrun-manylinux-x86_64"
         CIBW_BEFORE_BUILD_LINUX: "bash /project/tools/ci/patch_v8_git_for_manylinux.sh"
@@ -79,6 +96,7 @@ runs:
       uses: pypa/cibuildwheel@v3.3.1
       env:
         CIBW_BUILD: ${{ inputs.build }}
+        CIBW_SKIP: "*-musllinux_*"
         CIBW_BUILD_VERBOSITY: "1"
         CIBW_MANYLINUX_AARCH64_IMAGE: "jsrun-manylinux-aarch64"
         CIBW_BEFORE_BUILD_LINUX: "bash /project/tools/ci/patch_v8_git_for_manylinux.sh"
