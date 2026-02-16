@@ -30,7 +30,7 @@ runs:
         find artifacts -type f \( -name '*.whl' -o -name '*.tar.gz' \) -print -exec cp {} dist/ \;
         ls -lh dist/
 
-    - name: Nightly: add wheel build tag
+    - name: "Nightly: add wheel build tag"
       if: ${{ inputs.nightly_build_tag == 'true' }}
       shell: bash
       run: |
@@ -56,6 +56,36 @@ runs:
             whl.rename(new)
         PY
         ls -lh dist/
+
+    - name: Validate required Linux wheel assets
+      shell: bash
+      run: |
+        set -euo pipefail
+        shopt -s nullglob
+
+        required_patterns=(
+          "*cp314-cp314-manylinux_2_28_x86_64.whl"
+          "*cp314-cp314t-manylinux_2_28_x86_64.whl"
+          "*cp314-cp314-manylinux_2_28_aarch64.whl"
+          "*cp314-cp314t-manylinux_2_28_aarch64.whl"
+        )
+
+        missing=0
+        for pattern in "${required_patterns[@]}"; do
+          matches=(dist/${pattern})
+          if (( ${#matches[@]} == 0 )); then
+            echo "ERROR: missing required wheel matching pattern: ${pattern}" >&2
+            missing=1
+          else
+            printf 'Found %-45s %s\n' "${pattern}" "${matches[*]}"
+          fi
+        done
+
+        if (( missing != 0 )); then
+          echo "dist/ contents:" >&2
+          ls -lh dist >&2
+          exit 1
+        fi
 
     - name: Generate SHA256SUMS.txt
       shell: bash
@@ -86,7 +116,7 @@ runs:
         set -euo pipefail
         gh auth status
 
-    - name: Nightly: force-move tag
+    - name: "Nightly: force-move tag"
       if: ${{ inputs.tag == 'nightly' }}
       shell: bash
       run: |
@@ -120,7 +150,7 @@ runs:
           fi
         fi
 
-    - name: Nightly: delete old assets
+    - name: "Nightly: delete old assets"
       if: ${{ inputs.nightly_build_tag == 'true' }}
       shell: bash
       env:

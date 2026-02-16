@@ -19,7 +19,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-15]
+        os: [ubuntu-latest, macos-15]
         python: ["3.14", "3.14t"]
     steps:
       - uses: actions/setup-python@v6
@@ -58,9 +58,10 @@ jobs:
         run: |
           set -euo pipefail
           INDEX="https://mikz.github.io/jsrun/nightly/simple/"
+          INDEX_PAGE="${INDEX}jsrun/"
           FOUND=0
           for i in $(seq 1 60); do
-            if curl -fsSL "${INDEX}jsrun/" | grep -Eiq '\.(whl|tar\.gz)</a>' ; then
+            if curl -fsSL "${INDEX_PAGE}" | grep -Eiq '\.(whl|tar\.gz)</a>' ; then
               echo "Nightly package index populated."
               FOUND=1
               break
@@ -72,11 +73,25 @@ jobs:
             echo "ERROR: nightly index did not contain installable artifacts within timeout."
             exit 1
           fi
-          curl -fsSL "${INDEX}jsrun/" | head -n 100
+          PAGE="$(curl -fsSL "${INDEX_PAGE}")"
+          echo "${PAGE}" | head -n 100
+
+          if [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then
+            echo "${PAGE}" | grep -q 'manylinux_2_28_x86_64\.whl</a>' || {
+              echo "ERROR: nightly index missing manylinux_2_28_x86_64 wheel" >&2
+              exit 1
+            }
+            echo "${PAGE}" | grep -q 'manylinux_2_28_aarch64\.whl</a>' || {
+              echo "ERROR: nightly index missing manylinux_2_28_aarch64 wheel" >&2
+              exit 1
+            }
+          fi
+
           uv pip install \
             --python .venv/bin/python \
             --default-index "$INDEX" \
             --index-strategy first-index \
+            --no-build \
             --no-deps \
             jsrun
 
@@ -100,6 +115,7 @@ jobs:
               --python .venv/bin/python \
               --default-index "$INDEX" \
               --index-strategy first-index \
+              --no-build \
               --no-deps \
               --reinstall-package jsrun \
               jsrun
