@@ -37,14 +37,14 @@ runs:
       shell: bash
       run: rustup target add aarch64-apple-darwin
 
-    - name: Set up QEMU (linux aarch64)
-      if: ${{ inputs.platform == 'linux' && inputs.arch == 'aarch64' }}
+    - name: Set up QEMU (linux aarch64 emulation)
+      if: ${{ inputs.platform == 'linux' && inputs.arch == 'aarch64' && runner.arch != 'ARM64' }}
       uses: docker/setup-qemu-action@v3
       with:
         platforms: arm64
 
     - name: Set up Docker Buildx (linux)
-      if: ${{ inputs.platform == 'linux' }}
+      if: ${{ inputs.platform == 'linux' && (inputs.arch != 'aarch64' || runner.arch != 'ARM64') }}
       uses: docker/setup-buildx-action@v3
 
     - name: Build manylinux image (linux x86_64)
@@ -55,8 +55,17 @@ runs:
         docker build -t jsrun-manylinux-x86_64 -f .github/docker/Dockerfile.x86_64 .
         docker image ls jsrun-manylinux-x86_64
 
-    - name: Build manylinux image (linux aarch64)
-      if: ${{ inputs.platform == 'linux' && inputs.arch == 'aarch64' }}
+    - name: Build manylinux image (linux aarch64 native ARM)
+      if: ${{ inputs.platform == 'linux' && inputs.arch == 'aarch64' && runner.arch == 'ARM64' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        uname -a
+        docker build -t jsrun-manylinux-aarch64 -f .github/docker/Dockerfile.aarch64 .
+        docker image ls jsrun-manylinux-aarch64
+
+    - name: Build manylinux image (linux aarch64 emulated)
+      if: ${{ inputs.platform == 'linux' && inputs.arch == 'aarch64' && runner.arch != 'ARM64' }}
       shell: bash
       run: |
         set -euo pipefail

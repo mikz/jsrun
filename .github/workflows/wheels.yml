@@ -28,7 +28,7 @@ jobs:
             allow_fail: false
           - platform: linux
             arch: aarch64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04-arm
             allow_fail: false
           - platform: macos
             arch: x86_64
