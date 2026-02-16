@@ -34,14 +34,14 @@ jobs:
         run: uv sync --no-install-project --group docs
 
       - name: Build documentation
-        run: uv run mkdocs build
+        run: uv run --no-project mkdocs build
 
       - name: Generate PEP 503 indexes
         env:
           GITHUB_TOKEN: ${{ github.token }}
           OUTPUT_DIR: site
         run: |
-          python tools/generate_pep503_index.py
+          uv run --no-project python tools/generate_pep503_index.py
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v4
