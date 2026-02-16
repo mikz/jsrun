@@ -108,7 +108,6 @@ runs:
         CIBW_SKIP: "*-musllinux_*"
         CIBW_BUILD_VERBOSITY: "1"
         CIBW_MANYLINUX_AARCH64_IMAGE: "jsrun-manylinux-aarch64"
-        CIBW_BEFORE_BUILD_LINUX: "bash /project/tools/ci/patch_v8_git_for_manylinux.sh"
         CIBW_OUTPUT_DIR: "wheelhouse"
         CIBW_ARCHS_LINUX: "aarch64"
 
