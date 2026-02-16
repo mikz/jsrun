@@ -1,7 +1,7 @@
 # aarch64 manylinux builder for jsrun wheels.
 #
-# This image is used under QEMU (linux/arm64). It builds `v8` from source and
-# links against the provided glibc 2.28 sysroot for manylinux compatibility.
+# This image runs on native linux/arm64 runners and links against the provided
+# glibc 2.28 sysroot for manylinux compatibility.
 
 FROM ghcr.io/rust-cross/manylinux_2_28-cross:aarch64
 
@@ -52,8 +52,9 @@ ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-unknown-linux-gnu-gcc
 
 ENV EXTRA_GN_ARGS="target_sysroot=\"/usr/aarch64-unknown-linux-gnu/aarch64-unknown-linux-gnu/sysroot\" treat_warnings_as_errors=false use_glib=false"
 
-ENV V8_FROM_SOURCE=1
-ENV GN_ARGS="use_custom_libcxx=true v8_monolithic=true v8_monolithic_for_shared_library=true"
+# Use upstream prebuilt rusty_v8 archive for aarch64 instead of building V8
+# from source. Native arm64 runner builds avoid QEMU instability.
+ENV V8_FROM_SOURCE=0
 
 RUN printf '%s\n' \
     '#!/bin/bash' \
